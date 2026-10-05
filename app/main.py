@@ -1,0 +1,2988 @@
+import base64
+import binascii
+import json
+import logging
+import secrets
+import threading
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from uuid import UUID
+
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse
+from sqlalchemy import func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.orm import Session, selectinload
+
+from .config import settings
+from .db import SessionLocal, get_db
+from .migrations import (
+    TARGET_SCHEMA_VERSION,
+    MigrationFailedError,
+    NewerSchemaVersionError,
+    run_upgrade,
+)
+from .models import (
+    AUDIT_KIND_BUNDLE,
+    AUDIT_KIND_TOKEN,
+    BUNDLE_REQUEST_APPROVED,
+    BUNDLE_REQUEST_PENDING,
+    BUNDLE_REQUEST_REJECTED,
+    REQUEST_APPROVED,
+    REQUEST_PENDING,
+    REQUEST_REJECTED,
+    CredentialRotation,
+    PublishRequest as PublishRequestModel,
+    ReadAuditEvent,
+    ReadBundle,
+    ReadBundleItem,
+    ReadBundleRequest,
+    ReadToken,
+    Record,
+    RecordFreeze,
+    RecordVersion,
+    ROTATION_KIND_BUNDLE,
+    ROTATION_KIND_TOKEN,
+    SENSITIVE_PHRASE_SETTINGS_ID,
+    SensitivePhraseSettings,
+    Snapshot,
+    SnapshotWithdrawalPlan,
+    VersionOriginalDestruction,
+    WITHDRAWAL_PLAN_CANCELLED,
+    WITHDRAWAL_PLAN_COMPLETED,
+    WITHDRAWAL_PLAN_PENDING,
+    WITHDRAWAL_PLAN_SUPERSEDED,
+)
+from .redaction import (
+    IntervalOutOfBoundsError,
+    find_uncovered_phrase_hits,
+    redact_text,
+    validate_intervals,
+)
+from .schemas import (
+    ApproveResponse,
+    BundleApproveResponse,
+    BundleItemInfo,
+    BundleRequestCreate,
+    BundleRequestInfo,
+    BundleRequestListResponse,
+    BundleRevokeResponse,
+    BundleSubmitResponse,
+    ControlledFlagResponse,
+    ControlledPublishRequest,
+    ControlledSubmitResponse,
+    CredentialRotateRequest,
+    CredentialRotationResponse,
+    Interval,
+    PublicSnapshotResponse,
+    PublishRequest as PublishPayload,
+    PublishRequestInfo,
+    PublishRequestListResponse,
+    PublishResponse,
+    ReadAuditEventInfo,
+    ReadAuditEventPage,
+    ReadBundleListResponse,
+    ReadBundleStatusResponse,
+    RecordCreateRequest,
+    RecordFreezeRequest,
+    RecordFreezeResponse,
+    RecordFreezeStatus,
+    RecordResponse,
+    RecordReviseRequest,
+    RecordStatusResponse,
+    RecordUnfreezeResponse,
+    ReviewRejectRequest,
+    RevokeResponse,
+    RotationBundleItem,
+    SensitivePhraseListResponse,
+    SensitivePhraseReplaceRequest,
+    SnapshotInfo,
+    SnapshotWithdrawRequest,
+    SnapshotWithdrawResponse,
+    SnapshotWithdrawalPlanCancelResponse,
+    SnapshotWithdrawalPlanCreate,
+    SnapshotWithdrawalPlanCreateResponse,
+    SnapshotWithdrawalPlanInfo,
+    TokenStatusResponse,
+    VersionOriginalDestroyRequest,
+    VersionOriginalDestroyResponse,
+)
+from .security import Operator, require_operator, require_role, require_service_key
+
+logger = logging.getLogger("app.main")
+
+SNAPSHOT_STATUS = "published"
+SNAPSHOT_WITHDRAWN_STATUS = "withdrawn"
+
+
+def _snapshot_status(snapshot: Snapshot) -> str:
+    """快照维护状态：撤回为终态，撤回前沿用 published。"""
+    return SNAPSHOT_WITHDRAWN_STATUS if snapshot.withdrawn_at is not None else SNAPSHOT_STATUS
+
+
+# ---- 启动期数据库升级状态（门禁中间件据此放行或拒绝业务请求） ----
+
+# upgrading：启动升级进行中（此时连接被锁阻塞，不应接受业务请求）
+# ready：版本核对通过，可对外服务
+# failed：升级失败或库版本高于代码支持版本，拒绝一切业务请求（仅 /livez 可探活）
+UPGRADE_STATUS_UPGRADING = "upgrading"
+UPGRADE_STATUS_READY = "ready"
+UPGRADE_STATUS_FAILED = "failed"
+
+_upgrade_lock = threading.Lock()
+_upgrade_state: dict[str, object] = {
+    "status": UPGRADE_STATUS_UPGRADING,
+    "schema_version": None,
+    "error": None,
+}
+
+
+def get_upgrade_state() -> dict[str, object]:
+    with _upgrade_lock:
+        return dict(_upgrade_state)
+
+
+def _set_upgrade_state(status: str, *, error: str | None = None) -> None:
+    with _upgrade_lock:
+        _upgrade_state["status"] = status
+        _upgrade_state["error"] = error
+        if status == UPGRADE_STATUS_READY:
+            _upgrade_state["schema_version"] = TARGET_SCHEMA_VERSION
+
+
+def _init_db_with_retry() -> None:
+    """启动时执行有版本记录的数据库升级（等待库就绪 + 咨询锁内升级 + 核对）。
+
+    兼容测试与运维脚本中对该入口的直接调用：升级成功后把进程内状态置为 ready；
+    失败则置为 failed，由门禁中间件保证不对外提供业务服务。
+    """
+    try:
+        previous, applied = run_upgrade()
+        _set_upgrade_state(UPGRADE_STATUS_READY)
+        logger.info(
+            "startup database upgrade complete: %s -> v%s (applied: %s)",
+            previous,
+            TARGET_SCHEMA_VERSION,
+            applied or "none",
+        )
+    except NewerSchemaVersionError as exc:
+        # 未知的较新版本：绝不降级、绝不服务
+        logger.error("refusing to start serving: %s", exc)
+        _set_upgrade_state(UPGRADE_STATUS_FAILED, error=str(exc))
+    except MigrationFailedError as exc:
+        # 升级失败：失败版本已整体回滚；修复并重启后可重试
+        logger.error("database upgrade failed: %s", exc)
+        _set_upgrade_state(UPGRADE_STATUS_FAILED, error=str(exc))
+    except RuntimeError as exc:
+        # 数据库持续不可达
+        logger.error("database upgrade aborted: %s", exc)
+        _set_upgrade_state(UPGRADE_STATUS_FAILED, error=str(exc))
+
+
+# ---- 快照定时永久撤回：到期结算（惰性 + 后台轮询双保险） ----
+
+
+# 后台线程单轮最多结算的快照数；未处理完的计划留待下一轮（轮询间隔见配置）
+WITHDRAWAL_DUE_BATCH_SIZE = 200
+
+
+def _settle_snapshot_withdrawal_plans(db: Session, snapshot: Snapshot, now: datetime) -> None:
+    """在已持有的快照行锁内结算该快照的定时撤回计划；调用方负责加锁与提交。
+
+    - 快照仍公开且存在已到点（scheduled_at <= now）的 pending 计划：
+      以**预定时刻**为撤回时间、以**计划原因**为撤回原因执行撤回，
+      计划置 completed、ended_at 取预定时刻；
+    - 快照已撤回（手动撤回或本函数刚完成）：仍挂着的 pending 计划全部置
+      superseded 并以 now 终结——手动撤回先发生时计划即终止，撤回时间与原因
+      一律以手动撤回为准。
+
+    幂等且多实例安全：仅命中 status='pending' 的行；并发结算在快照行锁上
+    排队，后到者看到终态后无操作，恰好生效一次。不提交事务，由调用方提交。
+    """
+    due_plan = db.execute(
+        select(SnapshotWithdrawalPlan)
+        .where(
+            SnapshotWithdrawalPlan.snapshot_id == snapshot.id,
+            SnapshotWithdrawalPlan.status == WITHDRAWAL_PLAN_PENDING,
+            SnapshotWithdrawalPlan.scheduled_at <= now,
+        )
+        .order_by(SnapshotWithdrawalPlan.scheduled_at)
+        .with_for_update()
+        .limit(1)
+    ).scalar_one_or_none()
+    if snapshot.withdrawn_at is None and due_plan is not None:
+        # 计划到点即视为撤回：撤回时间取预定时刻（而非结算发生时刻），原因取计划原因。
+        snapshot.withdrawn_at = due_plan.scheduled_at
+        snapshot.withdraw_reason = due_plan.reason
+        due_plan.status = WITHDRAWAL_PLAN_COMPLETED
+        due_plan.ended_at = due_plan.scheduled_at
+        # 防御性：部分唯一索引保证每快照至多一个 pending 计划，此更新正常无额外命中
+        db.execute(
+            update(SnapshotWithdrawalPlan)
+            .where(
+                SnapshotWithdrawalPlan.snapshot_id == snapshot.id,
+                SnapshotWithdrawalPlan.status == WITHDRAWAL_PLAN_PENDING,
+                SnapshotWithdrawalPlan.id != due_plan.id,
+            )
+            .values(status=WITHDRAWAL_PLAN_SUPERSEDED, ended_at=now)
+        )
+        return
+    if snapshot.withdrawn_at is not None:
+        # 手动撤回先发生（或计划已在上一分支完成）：仍挂着的有效计划全部终止，
+        # 绝不改写既有撤回时间与原因。
+        db.execute(
+            update(SnapshotWithdrawalPlan)
+            .where(
+                SnapshotWithdrawalPlan.snapshot_id == snapshot.id,
+                SnapshotWithdrawalPlan.status == WITHDRAWAL_PLAN_PENDING,
+            )
+            .values(status=WITHDRAWAL_PLAN_SUPERSEDED, ended_at=now)
+        )
+
+
+def settle_due_withdrawals_once(db: Session, now: datetime | None = None) -> int:
+    """扫描并结算一批已到点的定时撤回计划（每个快照独立短事务）。
+
+    供后台调度线程与测试调用：扫描索引上最早到期的一批 pending 计划，
+    按快照逐个在“快照行 -> 计划行”的固定锁序内结算并提交。多实例并发扫描
+    到同一批计划也安全——行锁串行化，落选实例的条件 UPDATE 无命中，不会
+    重复撤回。返回本轮真正发生状态终结的快照数。
+    """
+    now = now or datetime.now(timezone.utc)
+    due_snapshot_ids = (
+        db.execute(
+            select(SnapshotWithdrawalPlan.snapshot_id)
+            .where(
+                SnapshotWithdrawalPlan.status == WITHDRAWAL_PLAN_PENDING,
+                SnapshotWithdrawalPlan.scheduled_at <= now,
+            )
+            .order_by(SnapshotWithdrawalPlan.scheduled_at)
+            .limit(WITHDRAWAL_DUE_BATCH_SIZE)
+        )
+        .scalars()
+        .all()
+    )
+    db.rollback()  # 只读扫描结束，释放事务后逐快照开新短事务，缩短持锁时间
+    settled = 0
+    for snapshot_id in due_snapshot_ids:
+        worker_db = SessionLocal()
+        try:
+            snapshot = worker_db.execute(
+                select(Snapshot).where(Snapshot.id == snapshot_id).with_for_update()
+            ).scalar_one_or_none()
+            if snapshot is None:
+                worker_db.rollback()
+                continue
+            due_here = worker_db.execute(
+                select(SnapshotWithdrawalPlan.id)
+                .where(
+                    SnapshotWithdrawalPlan.snapshot_id == snapshot_id,
+                    SnapshotWithdrawalPlan.status == WITHDRAWAL_PLAN_PENDING,
+                )
+                .with_for_update()
+            ).scalars().all()
+            if not due_here:
+                # 已被其他实例/请求结算：本次无终结
+                worker_db.rollback()
+                continue
+            was_public = snapshot.withdrawn_at is None
+            _settle_snapshot_withdrawal_plans(worker_db, snapshot, now)
+            worker_db.commit()
+            # 本轮在本快照完成了“计划到点撤回”或“已撤回快照的在途计划终止”
+            if was_public or snapshot.withdrawn_at is not None:
+                settled += 1
+        except Exception:
+            worker_db.rollback()
+            logger.exception("failed to settle due withdrawal plan for snapshot %s", snapshot_id)
+        finally:
+            worker_db.close()
+    return settled
+
+
+class _WithdrawalScheduler:
+    """定时撤回后台结算线程：每个 API 实例各跑一个，只做到期兜底。
+
+    正确性不依赖本线程：所有会触及快照行锁的请求路径（公开读取、手动撤回、
+    发布/复核等）都在锁内先惰性结算到期计划。本线程保证“无人访问的快照”
+    到点后也能及时落库；线程崩溃、服务重启或多实例并发都不影响语义——
+    计划持久化在库中，行锁与条件 UPDATE 保证恰好生效一次，绝不漏执行。
+    """
+
+    def __init__(self) -> None:
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        # 幂等：测试中重复进入 lifespan（或多实例同进程模拟）也只启动一个线程
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, name="snapshot-withdrawal-scheduler", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive() and threading.current_thread() is not thread:
+            thread.join(timeout=5)
+        self._thread = None
+
+    def _run(self) -> None:
+        while not self._stop.wait(settings.withdrawal_schedule_poll_seconds):
+            try:
+                db = SessionLocal()
+                try:
+                    settle_due_withdrawals_once(db)
+                finally:
+                    db.close()
+            except Exception:
+                logger.exception("scheduled withdrawal settlement tick failed")
+
+
+_withdrawal_scheduler = _WithdrawalScheduler()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _init_db_with_retry()
+    if get_upgrade_state()["status"] == UPGRADE_STATUS_READY:
+        # 仅升级成功、版本核对通过后才启动定时撤回结算线程；升级失败时全部门禁
+        # 503，无需结算。重启/多实例下计划在库，任一线程/任一实例都会结算到期计划。
+        _withdrawal_scheduler.start()
+    try:
+        yield
+    finally:
+        _withdrawal_scheduler.stop()
+
+
+app = FastAPI(
+    title="Redacted Records API",
+    version="1.13.0",
+    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 快照定时撤回 + 多快照共享凭证 + 泄露换发 + 成功读取审计 + 记录临时冻结 + 敏感短语清单核验 + 快照外部阅览时段 + 历史版本原文销毁 + 直接发布签发时刻修正 + 受控提交/批准统一锁序防死锁 + 版本化数据库升级）",
+    lifespan=lifespan,
+)
+
+_LIVEZ_PATH = "/livez"
+
+
+@app.middleware("http")
+async def block_traffic_unless_schema_ready(request: Request, call_next):
+    """数据库升级未完成、失败或版本不匹配时，拒绝一切业务请求。
+
+    - /livez 始终可用（进程存活探针，不代表可服务）；
+    - 其余路径在非 ready 状态统一返回 503，不执行任何业务逻辑，
+      鉴权与错误细节一律不暴露；编排系统据此摘流/重启。
+    """
+    if request.url.path == _LIVEZ_PATH:
+        return await call_next(request)
+    state = get_upgrade_state()
+    if state["status"] != UPGRADE_STATUS_READY:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": "service unavailable: database schema is not ready"},
+        )
+    return await call_next(request)
+
+
+def _validated_intervals(text: str, intervals: list[Interval]) -> list[tuple[int, int]]:
+    """越界区间直接 422，且发生在任何写库之前，保证整次拒绝。"""
+    try:
+        return validate_intervals(len(text), [(iv.start, iv.end) for iv in intervals])
+    except IntervalOutOfBoundsError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+
+
+# ---- 敏感短语清单核验（直接发布与受控申请提交/批准均须通过） ----
+
+
+def _lock_sensitive_phrase_settings(db: Session) -> SensitivePhraseSettings:
+    """锁定敏感短语清单单行并返回当前已提交版本。
+
+    发布/申请提交/批准事务在整个核验与提交期间持有该行的 FOR UPDATE 行锁；
+    与清单的原子替换串行化，保证核验与提交对应同一已提交清单版本：
+    - 替换先提交：等待行锁的核验在获锁后看到新清单，按新版本核验；
+    - 核验先提交：替换在其后生效，本次发布仍按旧清单完成，不受影响。
+    """
+    settings_row = db.execute(
+        select(SensitivePhraseSettings)
+        .where(SensitivePhraseSettings.id == SENSITIVE_PHRASE_SETTINGS_ID)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if settings_row is None:
+        # 理论上 v5 迁移已幂等插入固定单行；缺失说明结构异常，不猜测、不放行
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="sensitive phrase settings are not initialized",
+        )
+    return settings_row
+
+
+def _verify_against_settings(
+    settings_row: SensitivePhraseSettings, text: str, intervals: list[tuple[int, int]]
+) -> None:
+    """在已锁定的清单版本上核验：空清单停用核验；命中未完整覆盖则 422。
+
+    失败时只抛错，由调用方回滚。错误体只含未覆盖命中的码点区间，绝不回显
+    任何短语或原文。
+    """
+    phrases = list(settings_row.phrases or [])
+    if not phrases:
+        return
+    uncovered = find_uncovered_phrase_hits(text, phrases, intervals)
+    if uncovered:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": "sensitive phrase hits are not fully covered by redaction intervals",
+                "hits": [{"start": s, "end": e} for s, e in uncovered],
+            },
+        )
+
+
+def _request_info(request: PublishRequestModel) -> PublishRequestInfo:
+    """申请详情映射：只输出元数据，冻结原文绝不离开服务端。"""
+    return PublishRequestInfo(
+        request_id=request.id,
+        record_id=request.record_id,
+        version=request.version,
+        status=request.status,
+        requested_by=request.requested_by,
+        reviewed_by=request.reviewed_by,
+        reason=request.reason,
+        token_expires_in_seconds=request.token_expires_in_seconds,
+        token_expires_at=request.token_expires_at,
+        token_max_reads=request.token_max_reads,
+        window_open_at=request.window_open_at,
+        window_close_at=request.window_close_at,
+        snapshot_id=request.snapshot_id,
+        created_at=request.created_at,
+        decided_at=request.decided_at,
+    )
+
+
+def _validate_expiry_policy(
+    expires_in_seconds: int | None, expires_at: datetime | None
+) -> None:
+    """校验提交时选择的令牌到期策略：绝对时刻必须晚于提交时刻。
+
+    相对时长（expires_in_seconds）在批准签发时才换算，复核耗时不占用令牌寿命。
+    """
+    if expires_at is None:
+        return
+    normalized = expires_at if expires_at.tzinfo is not None else expires_at.replace(
+        tzinfo=timezone.utc
+    )
+    if normalized <= datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="expires_at must be in the future",
+        )
+
+
+def _normalize_window(
+    window_open_at: datetime | None, window_close_at: datetime | None
+) -> tuple[datetime | None, datetime | None]:
+    """把请求携带的外部阅览时段统一为 UTC aware 时刻对。
+
+    成对性（同填或同省）与开放早于截止已在请求 schema（422）校验；这里只做
+    naive -> UTC 与时区归一，供落库与逐时刻比较使用。
+    """
+    if window_open_at is None or window_close_at is None:
+        return None, None
+    open_at = window_open_at
+    close_at = window_close_at
+    if open_at.tzinfo is None:
+        open_at = open_at.replace(tzinfo=timezone.utc)
+    if close_at.tzinfo is None:
+        close_at = close_at.replace(tzinfo=timezone.utc)
+    return open_at.astimezone(timezone.utc), close_at.astimezone(timezone.utc)
+
+
+def _validate_window_at_submission(close_at: datetime | None) -> None:
+    """提交（直接发布/受控申请）时核对时段：截止时刻必须仍晚于当前服务端时刻。
+
+    开放时刻可以落在过去（允许“立即开放”）；截止已到则整次请求 422 拒绝，
+    不产生快照、令牌或待审申请。成对性与开放早于截止由 schema 保证。
+    """
+    if close_at is not None and close_at <= datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="window_close_at must be in the future",
+        )
+
+
+def _resolve_snapshot_window(
+    *,
+    existing_open_at: datetime | None,
+    existing_close_at: datetime | None,
+    requested_open_at: datetime | None,
+    requested_close_at: datetime | None,
+) -> tuple[datetime | None, datetime | None]:
+    """在已锁定的快照行上确定本次签发后生效的外部阅览时段。
+
+    快照时段只随首次发布确定、此后不可变：
+    - 本次省略时段 -> 原样沿用快照既有时段（首次设置或仍为无限制）；
+    - 本次显式填写且与既有时段完全相同 -> 幂等放行（重复发布同一设置）；
+    - 本次显式填写但与既有时段不同 -> 409 冲突拒绝，绝不改写快照
+      （含“已无限制的快照想补设时段”与“想改动已有时段”两种情形）。
+    """
+    requested_pair = (requested_open_at, requested_close_at)
+    existing_pair = (existing_open_at, existing_close_at)
+    if requested_open_at is None:
+        return existing_pair
+    if existing_open_at is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="snapshot has no reading window; its first publish set no window",
+        )
+    if requested_pair != existing_pair:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "snapshot reading window is fixed at its first publish "
+                "and cannot be changed",
+                "window_open_at": existing_open_at.isoformat(),
+                "window_close_at": existing_close_at.isoformat(),
+            },
+        )
+    return existing_pair
+
+
+def _window_active(
+    snapshot: Snapshot, now: datetime
+) -> bool:
+    """服务端资格判定时刻 now 是否落在快照外部阅览时段 [open, close) 内。
+
+    无时段（两列为 NULL）恒为有效窗口；带时段时开放时刻起含、截止时刻前不含。
+    """
+    if snapshot.window_open_at is None or snapshot.window_close_at is None:
+        return True
+    return snapshot.window_open_at <= now < snapshot.window_close_at
+
+
+def _bundle_request_info(request: ReadBundleRequest) -> BundleRequestInfo:
+    """共享凭证申请详情映射：只输出元数据，快照原文绝不离开服务端。"""
+    return BundleRequestInfo(
+        request_id=request.id,
+        status=request.status,
+        snapshot_ids=[UUID(sid) for sid in request.frozen_snapshot_ids],
+        requested_by=request.requested_by,
+        reviewed_by=request.reviewed_by,
+        reason=request.reason,
+        credential_expires_in_seconds=request.credential_expires_in_seconds,
+        credential_expires_at=request.credential_expires_at,
+        max_reads=request.max_reads,
+        bundle_id=request.bundle_id,
+        created_at=request.created_at,
+        decided_at=request.decided_at,
+    )
+
+
+def _bundle_active(bundle: ReadBundle, now: datetime) -> bool:
+    """凭证是否仍可成功读取：未撤销、未换发、未到期且共享额度未耗尽。"""
+    if bundle.revoked_at is not None or bundle.rotated_at is not None:
+        return False
+    if bundle.expires_at is not None and bundle.expires_at <= now:
+        return False
+    return bundle.reads_used < bundle.max_reads
+
+
+def _bundle_status_response(
+    bundle: ReadBundle, snapshots: dict[UUID, Snapshot]
+) -> ReadBundleStatusResponse:
+    """维护侧凭证状态映射：清单按提交顺序排列，绝不返回快照原文。"""
+    now = datetime.now(timezone.utc)
+    items = [
+        BundleItemInfo(
+            snapshot_id=item.snapshot_id,
+            record_id=snapshots[item.snapshot_id].record_id,
+            version=snapshots[item.snapshot_id].version,
+            position=item.position,
+            status=_snapshot_status(snapshots[item.snapshot_id]),
+            withdrawn_at=snapshots[item.snapshot_id].withdrawn_at,
+        )
+        for item in sorted(bundle.items, key=lambda item: item.position)
+    ]
+    return ReadBundleStatusResponse(
+        bundle_id=bundle.id,
+        credential=bundle.credential,
+        max_reads=bundle.max_reads,
+        reads_used=bundle.reads_used,
+        remaining_reads=max(bundle.max_reads - bundle.reads_used, 0),
+        active=_bundle_active(bundle, now),
+        created_at=bundle.created_at,
+        expires_at=bundle.expires_at,
+        revoked_at=bundle.revoked_at,
+        rotated_at=bundle.rotated_at,
+        items=items,
+    )
+
+
+@app.get("/livez")
+def livez():
+    """存活探针：进程在运行即 200，不代表数据库就绪；升级失败时仍可用。"""
+    state = get_upgrade_state()
+    body = {"status": "alive", "upgrade_status": state["status"]}
+    if state["status"] == UPGRADE_STATUS_FAILED:
+        body["error"] = "database schema upgrade failed or version mismatch"
+    return body
+
+
+@app.get("/readyz")
+def readyz():
+    """就绪探针：仅当数据库升级完成且版本核对通过时可达（中间件门禁）。"""
+    state = get_upgrade_state()
+    return {
+        "status": "ready",
+        "schema_version": state["schema_version"],
+        "supported_schema_version": TARGET_SCHEMA_VERSION,
+    }
+
+
+@app.get("/healthz")
+def healthz():
+    """兼容原有健康检查：升级未就绪时由中间件统一返回 503。"""
+    return {"status": "ok"}
+
+
+@app.post(
+    "/records",
+    status_code=status.HTTP_201_CREATED,
+    response_model=RecordResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def create_record(payload: RecordCreateRequest, db: Session = Depends(get_db)):
+    """创建记录（版本 1）：提交原文与敏感区间。"""
+    intervals = _validated_intervals(payload.text, payload.intervals)
+    record = Record(current_version=1)
+    db.add(record)
+    db.flush()
+    db.add(
+        RecordVersion(
+            record_id=record.id,
+            version=1,
+            original_text=payload.text,
+            intervals=[{"start": s, "end": e} for s, e in intervals],
+        )
+    )
+    db.commit()
+    return RecordResponse(record_id=record.id, version=1)
+
+
+@app.put(
+    "/records/{record_id}",
+    response_model=RecordResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def revise_record(record_id: UUID, payload: RecordReviseRequest, db: Session = Depends(get_db)):
+    """修订记录：必须携带当前版本号作为基准，过期则 409 并返回当前版本。"""
+    intervals = _validated_intervals(payload.text, payload.intervals)
+    # 条件更新是原子的：并发修订时只有一个能基于同一基准版本成功，
+    # 其余因 current_version 已变化而失败，不会产生分叉版本。
+    new_version = db.execute(
+        update(Record)
+        .where(Record.id == record_id, Record.current_version == payload.base_version)
+        .values(current_version=payload.base_version + 1)
+        .returning(Record.current_version)
+    ).scalar_one_or_none()
+    if new_version is None:
+        db.rollback()
+        record = db.get(Record, record_id)
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="record not found")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "base_version is stale",
+                "current_version": record.current_version,
+            },
+        )
+    db.add(
+        RecordVersion(
+            record_id=record_id,
+            version=new_version,
+            original_text=payload.text,
+            intervals=[{"start": s, "end": e} for s, e in intervals],
+        )
+    )
+    db.commit()
+    return RecordResponse(record_id=record_id, version=new_version)
+
+
+@app.put(
+    "/records/{record_id}/controlled",
+    response_model=ControlledFlagResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def mark_record_controlled(record_id: UUID, db: Session = Depends(get_db)):
+    """将记录设为受控发布（幂等：已是受控状态时直接返回当前状态）。"""
+    record = db.get(Record, record_id)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="record not found")
+    if not record.controlled:
+        record.controlled = True
+        db.commit()
+    return ControlledFlagResponse(record_id=record_id, controlled=True)
+
+
+@app.post(
+    "/records/{record_id}/publish",
+    status_code=status.HTTP_201_CREATED,
+    response_model=PublishResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def publish_record(record_id: UUID, payload: PublishPayload, db: Session = Depends(get_db)):
+    """直接发布指定版本：合并区间生成不可变快照，并签发随机读取令牌。
+
+    受控记录的直接发布请求一律 409 拒绝，必须走申请-复核流程。
+
+    可随版本携带带时区的外部阅览时段 window_open_at/window_close_at：两者须同时
+    填写且开放早于截止，提交时截止已到则 422 拒绝；均省略表示不携带时段——
+    快照首次发布未带时段则无时段限制（兼容既有请求），已有时段则沿用首次设置。
+    时段只随快照首次发布固定：同版本后续签发显式填写不同时段一律 409，不改写快照。
+
+    签发时刻（“先取锁、后取时”）：版本行、敏感短语清单行与快照行锁可能因并发
+    操作（版本原文销毁、清单替换、撤回/定时撤回结算等）等待任意时长。所有与
+    “当前服务端时刻”有关的签发判定——相对到期时长 expires_in_seconds 的换算、
+    显式 expires_at 是否仍未到、快照阅览时段（本次的或沿用首次发布的）是否已
+    截止、定时撤回计划是否到点——一律以**取齐这些行锁、惰性结算到点计划并确认
+    快照仍可发布之后**取得的服务端时刻 now 为准。相对时长从 now 起算（锁等待
+    不占用令牌寿命），响应回显与令牌落库的 expires_at 为同一绝对时刻；显式
+    expires_at 或阅览截止在等待中到达，则沿用既有 422 整次拒绝（回滚本次快照
+    INSERT），绝不留下新快照或令牌。
+    """
+    # 记录永不删除：普通读即可判定存在性（不加行锁，保持与公开读取
+    # “快照行 → 记录行”锁序不引入新的交叉环）。
+    record = db.get(Record, record_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="record version not found"
+        )
+    if record.controlled:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="record is controlled; submit a publish request for review instead",
+        )
+    # SELECT ... FOR UPDATE：与版本原文销毁串行化。销毁事务对该版本行执行
+    # UPDATE 清除原文，后拿到锁的发布必看到 original_text 为 NULL 并 409；
+    # 先提交的发布则按既有原文完成签发，不受其后销毁影响。
+    version = db.execute(
+        select(RecordVersion)
+        .where(RecordVersion.record_id == record_id, RecordVersion.version == payload.version)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if version is None:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="record version not found"
+        )
+    if version.original_text is None:
+        # 该版本原文已被销毁：直接发布一律拒绝（版本与脱敏区间仍留存）
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="original text of this record version has been destroyed",
+        )
+    # 请求级（取锁前）快速校验，尽早拒绝明显非法的请求；这两道校验都在取齐
+    # 行锁、确认快照仍可发布后**再次**进行权威判定，锁等待期间跨过界限时以
+    # 取锁后的服务端时刻为准。
+    explicit_expires_at = payload.expires_at
+    if explicit_expires_at is not None and explicit_expires_at.tzinfo is None:
+        explicit_expires_at = explicit_expires_at.replace(tzinfo=timezone.utc)
+    _validate_expiry_policy(payload.expires_in_seconds, explicit_expires_at)
+    window_open_at, window_close_at = _normalize_window(
+        payload.window_open_at, payload.window_close_at
+    )
+    _validate_window_at_submission(window_close_at)
+    version_intervals = [(iv["start"], iv["end"]) for iv in version.intervals]
+    # 敏感短语清单行（固定锁序的第一把）：在整个核验与提交期间持有其 FOR UPDATE
+    # 行锁，与清单的原子替换串行化，保证核验与提交对应同一已提交清单版本。
+    settings_row = _lock_sensitive_phrase_settings(db)
+    redacted = redact_text(version.original_text, version_intervals)
+    # 快照按 (record_id, version) 唯一：并发发布时唯一约束保证只落库一份，
+    # 且快照与令牌在同一事务提交，不会出现部分发布。
+    # 外部阅览时段只由首次发布写入：后续签发复用快照时 on_conflict_do_nothing
+    # 绝不覆盖既有时段；省略时段沿用首次设置，显式不同设置在锁行后冲突拒绝。
+    db.execute(
+        pg_insert(Snapshot)
+        .values(
+            record_id=record_id,
+            version=payload.version,
+            redacted_text=redacted,
+            window_open_at=window_open_at,
+            window_close_at=window_close_at,
+        )
+        .on_conflict_do_nothing(constraint="uq_snapshots_record_version")
+    )
+    # 锁定快照行后再判定撤回状态：与撤回操作串行化，
+    # 已被永久撤回的版本不能通过再次直接发布重新公开。
+    snapshot = db.execute(
+        select(Snapshot)
+        .where(Snapshot.record_id == record_id, Snapshot.version == payload.version)
+        .with_for_update()
+    ).scalar_one()
+    # 先取锁、后取时：此刻起持有本次签发所需的全部相关行锁（版本行、清单行、
+    # 快照行）。版本行锁、清单行锁与快照行锁上的等待都可能跨越令牌显式到期、
+    # 快照阅览时段截止或定时撤回计划到点；绝不能用等待前缓存的时刻做签发判定。
+    now = datetime.now(timezone.utc)
+    # 到点的定时撤回计划先在快照行锁内结算，再判定撤回状态：
+    # 计划到点后该版本不能通过再次直接发布重新公开。结算先提交落库，再返回 409。
+    _settle_snapshot_withdrawal_plans(db, snapshot, now)
+    if snapshot.withdrawn_at is not None:
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="snapshot has been withdrawn and cannot be published again",
+        )
+    # 快照时段首次发布后不可变：本次省略则沿用，显式不同则 409（绝不改写快照，
+    # 含首次发布的新 INSERT，随后回滚即不留下快照）。
+    effective_open_at, effective_close_at = _resolve_snapshot_window(
+        existing_open_at=snapshot.window_open_at,
+        existing_close_at=snapshot.window_close_at,
+        requested_open_at=window_open_at,
+        requested_close_at=window_close_at,
+    )
+    # 取锁后权威判定（覆盖行锁等待期间跨过界限的情形，沿用既有 422 整次拒绝；
+    # 失败回滚本次尚未提交的快照 INSERT，不留下新快照或令牌）：
+    # 1) 快照阅览时段（本次请求的或复用首次发布的）截止已到；
+    # 2) 显式 expires_at 已在等待期间到达。
+    if effective_close_at is not None and effective_close_at <= now:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="window_close_at must be in the future",
+        )
+    if explicit_expires_at is not None and explicit_expires_at <= now:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="expires_at must be in the future",
+        )
+    # 在已锁定的清单版本上核验原文与区间；不通过则整次回滚（含本次快照
+    # INSERT），不留下快照或令牌。
+    try:
+        _verify_against_settings(settings_row, version.original_text, version_intervals)
+    except HTTPException:
+        db.rollback()
+        raise
+    # 令牌到期只在签发时刻（取齐行锁、确认快照仍可发布之后的 now）最终确定，
+    # 响应回显与落库使用同一个绝对时刻：相对时长从 now 起算，等待行锁耗费的
+    # 时间绝不占用令牌寿命；显式 expires_at 沿用请求时的选择。
+    if payload.expires_in_seconds is not None:
+        expires_at = now + timedelta(seconds=payload.expires_in_seconds)
+    else:
+        expires_at = explicit_expires_at
+    token = ReadToken(
+        token=secrets.token_urlsafe(32),
+        snapshot_id=snapshot.id,
+        expires_at=expires_at,
+        max_reads=payload.max_reads,
+    )
+    db.add(token)
+    db.commit()
+    return {
+        "snapshot_id": snapshot.id,
+        "record_id": record_id,
+        "version": payload.version,
+        "status": SNAPSHOT_STATUS,
+        "token": token.token,
+        "expires_at": expires_at,
+        "max_reads": payload.max_reads,
+        "window_open_at": effective_open_at,
+        "window_close_at": effective_close_at,
+    }
+
+
+@app.post(
+    "/records/{record_id}/publish-requests",
+    status_code=status.HTTP_201_CREATED,
+    response_model=ControlledSubmitResponse,
+)
+def submit_publish_request(
+    record_id: UUID,
+    payload: ControlledPublishRequest,
+    operator: Operator = Depends(require_role("operator")),
+    db: Session = Depends(get_db),
+):
+    """提交受控发布申请：用申请人的个人凭据，冻结提交时刻的历史版本内容。
+
+    可随申请携带带时区的外部阅览时段 window_open_at/window_close_at（两者同时填写、
+    开放早于截止，截止已到则 422），时段在提交时随申请冻结，复核耗时不改变它；
+    均省略表示不携带时段。批准时若冻结时段的截止已到则拒绝批准（409），申请仍
+    待审、可驳回；批准签发时若申请时段与快照首次发布已有时段不一致则整次批准
+    失败，绝不改写快照。
+
+    固定加锁顺序为“版本行 → 敏感短语清单行 → 快照行”，与直接发布及批准
+    （申请行 → 清单行 → 快照行）同序：同一快照上的提交与批准并发交错时不会
+    相互等待而死锁。提交先锁清单行、再锁快照行并在其锁内惰性结算到点计划、
+    核对撤回状态（已撤回先按现有规则结算到点计划再 409）；取齐行锁后再按获锁
+    时刻复核到期策略与冻结阅览时段截止（沿用旧错误优先级），随后在同一清单行
+    锁内按获锁当时已提交的清单版本核验原文与遮蔽区间并冻结内容（等待期间清单
+    被替换则按新版本核验，不通过沿用 422、不留下任何半成品）。
+    """
+    # 记录永不删除：普通读判定存在性即可（不加行锁，避免与公开读取
+    # “快照行 → 记录行”锁序引入新的交叉锁序环）。
+    record = db.get(Record, record_id)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="record not found")
+    if not record.controlled:
+        # 非受控记录应使用直接发布，明确拒绝以免误用流程
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="record is not controlled; use the direct publish endpoint",
+        )
+    # SELECT ... FOR UPDATE：与版本原文销毁按事务提交顺序串行化。
+    # 销毁提交后才拿到版本行锁的提交必看到 original_text 为 NULL 并 409，
+    # 不会冻结出一份原文已清除的待审申请；先提交的申请则正常冻结原文，
+    # 其 frozen_text 随后由销毁事务一并清除。
+    version = db.execute(
+        select(RecordVersion)
+        .where(RecordVersion.record_id == record_id, RecordVersion.version == payload.version)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if version is None:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="record version not found"
+        )
+    if version.original_text is None:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="original text of this record version has been destroyed",
+        )
+    # 到期策略与外部阅览时段先做无时钟依赖的归一化；“未来时刻”校验沿用旧流程，
+    # 在快照撤回判定之后、短语核验之前进行（错误优先级与旧实现一致：
+    # 已撤回 409 → 时段/到期 422 → 短语未覆盖 422）。
+    expires_at = payload.expires_at
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    window_open_at, window_close_at = _normalize_window(
+        payload.window_open_at, payload.window_close_at
+    )
+    frozen_intervals = [dict(iv) for iv in version.intervals]
+    frozen_interval_pairs = [(iv["start"], iv["end"]) for iv in frozen_intervals]
+    # 固定锁序恒为“版本行 → 敏感短语清单行 → 快照行”，与直接发布
+    # （版本行 → 清单行 → 快照行）及批准（申请行 → 清单行 → 快照行）同序：
+    # 旧实现先锁快照行再锁清单行，与批准的“清单行 → 快照行”反向，同一快照上
+    # 提交与批准并发交错时会相互等待而触发数据库死锁，使合法操作失败。
+    # 先锁定清单单行（持有至本次提交/回滚），保证随后的核验与冻结对应同一已提交
+    # 清单版本；此处只取锁、不核验——撤回结算/409 的旧优先级与直接发布一致，
+    # 时段/短语核验在快照状态判定之后仍于同一清单行锁内完成。
+    settings_row = _lock_sensitive_phrase_settings(db)
+    # 清单行之后再锁同版本快照行：在快照行锁内惰性结算到点的定时撤回计划，再按
+    # 当前状态判定——已永久撤回（含本轮刚结算）的版本不能再提交受控申请。
+    # 结算先提交落库，再返回 409。
+    existing_snapshot = db.execute(
+        select(Snapshot)
+        .where(
+            Snapshot.record_id == record_id, Snapshot.version == payload.version
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
+    if existing_snapshot is not None:
+        _settle_snapshot_withdrawal_plans(
+            db, existing_snapshot, datetime.now(timezone.utc)
+        )
+        if existing_snapshot.withdrawn_at is not None:
+            db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="snapshot of this version has been withdrawn",
+            )
+    # 取齐版本/清单/快照行锁后再做提交时刻校验（“先取锁、后取时”，与批准一致）：
+    # 显式到期时刻与随申请冻结的阅览时段截止必须仍晚于当前服务端时刻，行锁等待
+    # 期间跨过界限也在此被捕获；不通过整次拒绝，不产生待审申请、快照或令牌。
+    _validate_expiry_policy(payload.expires_in_seconds, expires_at)
+    _validate_window_at_submission(window_close_at)
+    # 在已锁定的同一清单版本内核验原文与遮蔽区间并冻结内容：等待期间清单被替换
+    # 则获锁后按新版本核验；不通过沿用既有 422（只回未覆盖命中码点），整次回滚，
+    # 不留下申请、快照或令牌。
+    try:
+        _verify_against_settings(
+            settings_row, version.original_text, frozen_interval_pairs
+        )
+    except HTTPException:
+        db.rollback()
+        raise
+    # 待审内容在此冻结：后续修订只产生新版本，不改变本申请绑定的原文与区间
+    request = PublishRequestModel(
+        record_id=record_id,
+        version=payload.version,
+        frozen_text=version.original_text,
+        frozen_intervals=frozen_intervals,
+        status=REQUEST_PENDING,
+        requested_by=operator.username,
+        token_expires_in_seconds=payload.expires_in_seconds,
+        token_expires_at=expires_at,
+        token_max_reads=payload.max_reads,
+        window_open_at=window_open_at,
+        window_close_at=window_close_at,
+    )
+    db.add(request)
+    db.commit()
+    return ControlledSubmitResponse(
+        request_id=request.id,
+        record_id=record_id,
+        version=payload.version,
+        status=request.status,
+        requested_by=request.requested_by,
+        created_at=request.created_at,
+        window_open_at=window_open_at,
+        window_close_at=window_close_at,
+    )
+
+
+@app.post(
+    "/publish-requests/{request_id}/approve",
+    response_model=ApproveResponse,
+)
+def approve_publish_request(
+    request_id: UUID,
+    operator: Operator = Depends(require_role("reviewer")),
+    db: Session = Depends(get_db),
+):
+    """批准申请：沿用既有脱敏与令牌规则，同事务生成快照与新读取令牌。
+
+    申请人不得复核；已终态（批准/驳回）的申请一律 409；
+    行锁串行化并发复核，保证同一申请只有一个终态。
+
+    所有与“当前服务端时刻”有关的判定（定时撤回计划是否到点、冻结阅览时段是否
+    截止、令牌到期换算、申请终结时刻）一律以**取得相关行锁之后**取得的服务端
+    时刻 now 为准：申请行锁等待可能跨过计划生效或时段截止，绝不能用等待前的
+    时刻做判定。计划到点时先在快照行锁内按预定时刻与计划原因完成撤回结算并
+    提交，再返回 409（申请仍待审、可驳回，不签发令牌）；冻结时段已截止时同样
+    409 且不生成快照或令牌，申请保持待审。
+
+    申请冻结了外部阅览时段时：截止时刻已到则拒绝批准（409），申请保持待审、
+    仍可驳回；时段与同版本快照首次发布已有时段不同则 409，绝不改写快照；
+    申请未带时段则沿用快照既有时段（首次设置或仍为无限制）。
+    """
+    # SELECT ... FOR UPDATE：并发复核在此排队，后进入者会看到已终态并被拒绝。
+    # 不显式锁记录行：销毁不持记录行锁，二者仅在申请行上排队；插入新快照时
+    # 外键取记录行 KEY SHARE，与公开读取的“快照行 → 记录行”锁序保持同序，
+    # 不引入新的死锁环。
+    request = db.execute(
+        select(PublishRequestModel)
+        .where(PublishRequestModel.id == request_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if request is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="publish request not found"
+        )
+    if request.status != REQUEST_PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "publish request already decided",
+                "status": request.status,
+            },
+        )
+    if request.requested_by == operator.username:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="the requester may not review their own publish request",
+        )
+    if request.frozen_text is None:
+        # 该申请冻结的版本原文已被销毁：不能再批准签发。
+        # 销毁事务先锁本申请行（FOR UPDATE 已在此持有）再清空 frozen_text，
+        # 故这里看到的必为已提交的销毁结果；申请保持待审，仍可被驳回。
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="frozen original text of this publish request has been destroyed; "
+            "the request stays pending and may be rejected",
+        )
+    frozen_intervals = [(iv["start"], iv["end"]) for iv in request.frozen_intervals]
+
+    # 先取锁、后取时：申请行锁可能等待了任意时长，任何“到点/截止”判定都必须
+    # 在全部相关行锁到手之后再读服务端时钟。锁序恒为“申请行 → 清单行 → 快照行”，
+    # 其中“清单行 → 快照行”与直接发布及受控申请提交
+    # （版本行 → 清单行 → 快照行）同序：同一快照上的批准与提交并发交错时不会
+    # 相互等待而死锁。
+    # 清单行（固定锁序的第一把）：批准时用“获锁当时启用”的清单重新核验申请
+    # 冻结的原文与区间（清单可能已在锁等待期间变更），行锁持有到本次提交/回滚。
+    settings_row = _lock_sensitive_phrase_settings(db)
+    redacted = redact_text(request.frozen_text, frozen_intervals)
+    # 快照按 (record_id, version) 唯一：快照行锁是计划到点结算与撤回状态判定的
+    # 串行点，必须先把快照行确定并锁住，再做任何基于当前时刻的判定。INSERT 与
+    # 随后的 FOR UPDATE 在同一事务内，冲突时 on_conflict_do_nothing 复用既存行。
+    db.execute(
+        pg_insert(Snapshot)
+        .values(
+            record_id=request.record_id,
+            version=request.version,
+            redacted_text=redacted,
+            window_open_at=request.window_open_at,
+            window_close_at=request.window_close_at,
+        )
+        .on_conflict_do_nothing(constraint="uq_snapshots_record_version")
+    )
+    snapshot = db.execute(
+        select(Snapshot)
+        .where(
+            Snapshot.record_id == request.record_id,
+            Snapshot.version == request.version,
+        )
+        .with_for_update()
+    ).scalar_one()
+    # 此刻起持有全部相关行锁（申请行、清单行、快照行）：now 是本次批准唯一
+    # 有效的服务端判定时刻，计划到点、时段截止、到期换算与终结时刻都用它。
+    now = datetime.now(timezone.utc)
+    # 申请等待锁期间到点的定时撤回计划先在快照行锁内结算：到点即以**预定时刻**
+    # 为撤回时间、以**计划原因**完成撤回（与手动撤回走同一终态），不能批准
+    # 重新公开。结算先提交落库，再返回 409；申请保持待审、仍可驳回，不签发令牌。
+    _settle_snapshot_withdrawal_plans(db, snapshot, now)
+    if snapshot.withdrawn_at is not None:
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="snapshot of this version has been withdrawn",
+        )
+    # 外部阅览时段在申请提交时已冻结；以获锁后的 now 判定截止时刻是否已到：
+    # 已到则拒绝批准——回滚本次尚未提交的快照 INSERT，不产生快照或令牌，
+    # 申请保持待审、仍可被驳回。
+    if request.window_close_at is not None and request.window_close_at <= now:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="frozen reading window has already closed; "
+            "the request stays pending and may be rejected",
+        )
+    # 在已锁定的清单版本上核验冻结原文与区间；不通过则整次拒绝（回滚本次快照
+    # INSERT 与全部锁）：不产生快照或令牌，申请保持待审且仍可驳回。
+    try:
+        _verify_against_settings(settings_row, request.frozen_text, frozen_intervals)
+    except HTTPException:
+        db.rollback()
+        raise
+    # 快照时段只随首次发布确定：申请未带时段则沿用快照既有时段（首次设置或仍为
+    # 无限制）；申请显式冻结的时段与快照既有时段不同则整次批准失败，绝不改写快照，
+    # 申请保持待审、仍可驳回。
+    effective_open_at, effective_close_at = _resolve_snapshot_window(
+        existing_open_at=snapshot.window_open_at,
+        existing_close_at=snapshot.window_close_at,
+        requested_open_at=request.window_open_at,
+        requested_close_at=request.window_close_at,
+    )
+    # 快照与令牌在同一事务内生成：任一步失败整体回滚，不会留下可读令牌。
+    # 相对到期时长在签发时刻（获锁后的 now）换算为绝对时刻；显式到期时刻沿用申请时的选择。
+    if request.token_expires_in_seconds is not None:
+        token_expires_at = now + timedelta(seconds=request.token_expires_in_seconds)
+    else:
+        token_expires_at = request.token_expires_at
+    token = ReadToken(
+        token=secrets.token_urlsafe(32),
+        snapshot_id=snapshot.id,
+        expires_at=token_expires_at,
+        max_reads=request.token_max_reads,
+    )
+    db.add(token)
+    db.flush()  # 确保令牌已在事务内落库后再终结申请
+    request.status = REQUEST_APPROVED
+    request.reviewed_by = operator.username
+    request.snapshot_id = snapshot.id
+    request.token_expires_at = token_expires_at
+    request.decided_at = now
+    db.commit()
+    return ApproveResponse(
+        request_id=request.id,
+        record_id=request.record_id,
+        version=request.version,
+        status=request.status,
+        reviewed_by=operator.username,
+        snapshot_id=snapshot.id,
+        token=token.token,
+        expires_at=token_expires_at,
+        max_reads=request.token_max_reads,
+        window_open_at=effective_open_at,
+        window_close_at=effective_close_at,
+    )
+
+
+@app.post(
+    "/publish-requests/{request_id}/reject",
+    response_model=PublishRequestInfo,
+)
+def reject_publish_request(
+    request_id: UUID,
+    payload: ReviewRejectRequest = Body(default_factory=ReviewRejectRequest),
+    operator: Operator = Depends(require_role("reviewer")),
+    db: Session = Depends(get_db),
+):
+    """驳回申请：不生成快照与令牌；驳回是终态，此后不能再批准。"""
+    request = db.execute(
+        select(PublishRequestModel)
+        .where(PublishRequestModel.id == request_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if request is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="publish request not found"
+        )
+    if request.status != REQUEST_PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "publish request already decided",
+                "status": request.status,
+            },
+        )
+    if request.requested_by == operator.username:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="the requester may not review their own publish request",
+        )
+    request.status = REQUEST_REJECTED
+    request.reviewed_by = operator.username
+    request.reason = payload.reason
+    request.decided_at = datetime.now(timezone.utc)
+    db.commit()
+    return _request_info(request)
+
+
+@app.get(
+    "/publish-requests/{request_id}",
+    response_model=PublishRequestInfo,
+)
+def get_publish_request(
+    request_id: UUID,
+    operator: Operator = Depends(require_operator),
+    db: Session = Depends(get_db),
+):
+    """查看单个申请状态（任何已认证操作者可查；不返回冻结原文）。"""
+    request = db.get(PublishRequestModel, request_id)
+    if request is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="publish request not found"
+        )
+    return _request_info(request)
+
+
+@app.get(
+    "/records/{record_id}/publish-requests",
+    response_model=PublishRequestListResponse,
+)
+def list_publish_requests(
+    record_id: UUID,
+    operator: Operator = Depends(require_operator),
+    db: Session = Depends(get_db),
+):
+    """列出某条记录的全部受控发布申请（不返回冻结原文）。"""
+    record = db.get(Record, record_id)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="record not found")
+    requests = (
+        db.execute(
+            select(PublishRequestModel)
+            .where(PublishRequestModel.record_id == record_id)
+            .order_by(PublishRequestModel.created_at)
+        )
+        .scalars()
+        .all()
+    )
+    return PublishRequestListResponse(
+        record_id=record_id, requests=[_request_info(request) for request in requests]
+    )
+
+
+# ---- 多快照共享凭证（read bundle）：申请-复核 + 共用读取额度 ----
+
+
+@app.post(
+    "/bundle-requests",
+    status_code=status.HTTP_201_CREATED,
+    response_model=BundleSubmitResponse,
+)
+def submit_bundle_request(
+    payload: BundleRequestCreate,
+    operator: Operator = Depends(require_role("operator")),
+    db: Session = Depends(get_db),
+):
+    """提交多快照共享凭证申请：冻结清单、可选到期策略与正整数共享总额度。
+
+    清单在提交时定形：至少两个互不重复的快照 ID，且全部为已存在且未撤回
+    的快照；未知快照 404、已撤回快照 409。批准时会再次重新核对全部快照。
+    """
+    snapshot_ids = list(dict.fromkeys(payload.snapshot_ids))  # 去重保序（重复已在 schema 拒绝）
+    snapshots = (
+        db.execute(
+            select(Snapshot).where(Snapshot.id.in_(snapshot_ids)).with_for_update()
+        )
+        .scalars()
+        .all()
+    )
+    by_id = {snapshot.id: snapshot for snapshot in snapshots}
+    missing = [sid for sid in snapshot_ids if sid not in by_id]
+    if missing:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="snapshot not found"
+        )
+    # 到点的定时撤回计划在快照行锁内先结算，再按当前状态判定
+    settle_now = datetime.now(timezone.utc)
+    for sid in snapshot_ids:
+        _settle_snapshot_withdrawal_plans(db, by_id[sid], settle_now)
+    withdrawn = [sid for sid in snapshot_ids if by_id[sid].withdrawn_at is not None]
+    if withdrawn:
+        # 已撤回快照不能进入共享凭证；批准时还会重新核对。
+        # 可能包含本轮到期结算，先提交落库，再返回 409。
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="one or more snapshots have been withdrawn",
+        )
+    _validate_expiry_policy(payload.expires_in_seconds, payload.expires_at)
+    expires_at = payload.expires_at
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    # 清单在此冻结：JSONB 以字符串数组存放 UUID，之后快照撤回等变化不改变本申请清单
+    request = ReadBundleRequest(
+        frozen_snapshot_ids=[str(sid) for sid in snapshot_ids],
+        status=BUNDLE_REQUEST_PENDING,
+        requested_by=operator.username,
+        credential_expires_in_seconds=payload.expires_in_seconds,
+        credential_expires_at=expires_at,
+        max_reads=payload.max_reads,
+    )
+    db.add(request)
+    db.commit()
+    return BundleSubmitResponse(
+        request_id=request.id,
+        status=request.status,
+        snapshot_ids=snapshot_ids,
+        requested_by=request.requested_by,
+        max_reads=request.max_reads,
+        created_at=request.created_at,
+    )
+
+
+@app.post(
+    "/bundle-requests/{request_id}/approve",
+    response_model=BundleApproveResponse,
+)
+def approve_bundle_request(
+    request_id: UUID,
+    operator: Operator = Depends(require_role("reviewer")),
+    db: Session = Depends(get_db),
+):
+    """批准共享凭证申请：重新核对冻结清单全部快照，全部有效才一次性签发凭证。
+
+    - 申请人不得复核自己的申请 -> 403；
+    - 已终态的申请再次操作 -> 409；并发复核由申请行行锁串行化；
+    - 任一快照已不存在或已撤回 -> 整次批准失败（409），不签发凭证，申请仍可驳回；
+    - 凭证、清单项与申请终态在同一事务提交，任一异常整体回滚。
+    """
+    request = db.execute(
+        select(ReadBundleRequest)
+        .where(ReadBundleRequest.id == request_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if request is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="bundle request not found"
+        )
+    if request.status != BUNDLE_REQUEST_PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "bundle request already decided",
+                "status": request.status,
+            },
+        )
+    if request.requested_by == operator.username:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="the requester may not review their own bundle request",
+        )
+
+    snapshot_ids = [UUID(sid) for sid in request.frozen_snapshot_ids]
+    # 批准时重新核对：对全部快照行加锁（按 id 定序，避免多实例/多事务交叉加锁死锁），
+    # 任一项失效则整次批准失败、不签发凭证。FOR UPDATE 与撤回/定时撤回结算串行化；
+    # 撤回提交（含到点计划结算）后才进入核对的批准必定看到失效项。
+    snapshots = (
+        db.execute(
+            select(Snapshot)
+            .where(Snapshot.id.in_(snapshot_ids))
+            .order_by(Snapshot.id)
+            .with_for_update()
+        )
+        .scalars()
+        .all()
+    )
+    by_id = {snapshot.id: snapshot for snapshot in snapshots}
+    settle_now = datetime.now(timezone.utc)
+    for sid in sorted(by_id):
+        _settle_snapshot_withdrawal_plans(db, by_id[sid], settle_now)
+    if len(by_id) != len(snapshot_ids) or any(
+        sid not in by_id or by_id[sid].withdrawn_at is not None for sid in snapshot_ids
+    ):
+        # 申请保持 pending：不签发凭证，本次批准失败，但申请仍可被驳回。
+        # 可能包含本轮到期结算，先提交落库，再返回 409。
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="one or more snapshots in the frozen list are no longer available",
+        )
+
+    if request.credential_expires_in_seconds is not None:
+        expires_at = datetime.now(timezone.utc) + timedelta(
+            seconds=request.credential_expires_in_seconds
+        )
+    else:
+        expires_at = request.credential_expires_at
+    # 一次性签发随机凭证并绑定冻结清单：凭证、清单项与申请终态同事务提交
+    bundle = ReadBundle(
+        credential=secrets.token_urlsafe(32),
+        max_reads=request.max_reads,
+        expires_at=expires_at,
+    )
+    db.add(bundle)
+    db.flush()  # 取得 bundle.id 后写入清单项
+    for position, snapshot_id in enumerate(snapshot_ids):
+        db.add(
+            ReadBundleItem(
+                bundle_id=bundle.id,
+                snapshot_id=snapshot_id,
+                position=position,
+            )
+        )
+    request.status = BUNDLE_REQUEST_APPROVED
+    request.reviewed_by = operator.username
+    request.bundle_id = bundle.id
+    request.credential_expires_at = expires_at
+    request.decided_at = datetime.now(timezone.utc)
+    db.commit()
+    return BundleApproveResponse(
+        request_id=request.id,
+        status=request.status,
+        reviewed_by=operator.username,
+        bundle_id=bundle.id,
+        credential=bundle.credential,
+        snapshot_ids=snapshot_ids,
+        expires_at=expires_at,
+        max_reads=request.max_reads,
+    )
+
+
+@app.post(
+    "/bundle-requests/{request_id}/reject",
+    response_model=BundleRequestInfo,
+)
+def reject_bundle_request(
+    request_id: UUID,
+    payload: ReviewRejectRequest = Body(default_factory=ReviewRejectRequest),
+    operator: Operator = Depends(require_role("reviewer")),
+    db: Session = Depends(get_db),
+):
+    """驳回共享凭证申请：不签发凭证；驳回是终态，此后不能再批准。"""
+    request = db.execute(
+        select(ReadBundleRequest)
+        .where(ReadBundleRequest.id == request_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if request is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="bundle request not found"
+        )
+    if request.status != BUNDLE_REQUEST_PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "bundle request already decided",
+                "status": request.status,
+            },
+        )
+    if request.requested_by == operator.username:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="the requester may not review their own bundle request",
+        )
+    request.status = BUNDLE_REQUEST_REJECTED
+    request.reviewed_by = operator.username
+    request.reason = payload.reason
+    request.decided_at = datetime.now(timezone.utc)
+    db.commit()
+    return _bundle_request_info(request)
+
+
+@app.get(
+    "/bundle-requests/{request_id}",
+    response_model=BundleRequestInfo,
+)
+def get_bundle_request(
+    request_id: UUID,
+    operator: Operator = Depends(require_operator),
+    db: Session = Depends(get_db),
+):
+    """查看单个共享凭证申请（任何已认证操作者可查；不返回快照原文）。"""
+    request = db.get(ReadBundleRequest, request_id)
+    if request is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="bundle request not found"
+        )
+    return _bundle_request_info(request)
+
+
+@app.get(
+    "/bundle-requests",
+    response_model=BundleRequestListResponse,
+)
+def list_bundle_requests(
+    operator: Operator = Depends(require_operator),
+    db: Session = Depends(get_db),
+):
+    """列出全部共享凭证申请（任何已认证操作者可查；只含元数据）。"""
+    requests = (
+        db.execute(
+            select(ReadBundleRequest).order_by(ReadBundleRequest.created_at)
+        )
+        .scalars()
+        .all()
+    )
+    return BundleRequestListResponse(
+        requests=[_bundle_request_info(request) for request in requests]
+    )
+
+
+@app.get(
+    "/read-bundles",
+    response_model=ReadBundleListResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def list_read_bundles(db: Session = Depends(get_db)):
+    """维护侧查询全部共享凭证的清单、额度与状态（绝不返回快照原文）。"""
+    bundles = (
+        db.execute(
+            select(ReadBundle)
+            .options(selectinload(ReadBundle.items))
+            .order_by(ReadBundle.created_at)
+        )
+        .scalars()
+        .all()
+    )
+    snapshots = _load_bundle_snapshots(db, bundles)
+    return ReadBundleListResponse(
+        bundles=[_bundle_status_response(bundle, snapshots) for bundle in bundles]
+    )
+
+
+@app.get(
+    "/read-bundles/{bundle_id}",
+    response_model=ReadBundleStatusResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def get_read_bundle(bundle_id: UUID, db: Session = Depends(get_db)):
+    """维护侧查询单个共享凭证的清单、额度与状态（绝不返回快照原文）。"""
+    bundle = db.get(ReadBundle, bundle_id)
+    if bundle is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="read bundle not found"
+        )
+    snapshots = _load_bundle_snapshots(db, [bundle])
+    return _bundle_status_response(bundle, snapshots)
+
+
+@app.post(
+    "/read-bundles/{bundle_id}/revoke",
+    response_model=BundleRevokeResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def revoke_read_bundle(bundle_id: UUID, db: Session = Depends(get_db)):
+    """撤销共享凭证：原子条件 UPDATE，提交后新开始的读取一律拒绝。"""
+    result = db.execute(
+        update(ReadBundle)
+        .where(ReadBundle.id == bundle_id, ReadBundle.revoked_at.is_(None))
+        .values(revoked_at=func.now())
+    )
+    db.commit()
+    if result.rowcount:
+        return BundleRevokeResponse(
+            bundle_id=bundle_id, revoked=True, already_revoked=False
+        )
+    if db.get(ReadBundle, bundle_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="read bundle not found"
+        )
+    return BundleRevokeResponse(
+        bundle_id=bundle_id, revoked=True, already_revoked=True
+    )
+
+
+def _load_bundle_snapshots(
+    db: Session, bundles: list[ReadBundle]
+) -> dict[UUID, Snapshot]:
+    """批量取清单项引用的快照（维护侧需要其 record/version 与撤回状态）。"""
+    snapshot_ids = {
+        item.snapshot_id
+        for bundle in bundles
+        for item in bundle.items
+    }
+    if not snapshot_ids:
+        return {}
+    snapshots = (
+        db.execute(select(Snapshot).where(Snapshot.id.in_(snapshot_ids)))
+        .scalars()
+        .all()
+    )
+    return {snapshot.id: snapshot for snapshot in snapshots}
+
+
+# ---- 读取凭证泄露换发（单快照令牌 / 多快照共享凭证统一入口） ----
+
+
+def _rotation_conflict(reason: str) -> None:
+    """换发资格不满足或并发落选：统一 409，不把可换发凭证换成新凭证。"""
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"message": "credential is not eligible for rotation", "reason": reason},
+    )
+
+
+def _rotation_payload(
+    *,
+    kind: str,
+    request_id: str,
+    old_credential: str,
+    new_credential: str,
+    snapshot_ids: list[UUID],
+    expires_at: datetime | None,
+    max_reads: int | None,
+    reads_used: int,
+    rotated_at: datetime,
+    items: list[RotationBundleItem] | None = None,
+) -> CredentialRotationResponse:
+    """组装换发响应：剩余额度按换发时已用次数结算（不限次时为 null）。"""
+    remaining = None if max_reads is None else max(max_reads - reads_used, 0)
+    return CredentialRotationResponse(
+        kind=kind,
+        request_id=request_id,
+        old_credential=old_credential,
+        new_credential=new_credential,
+        snapshot_ids=snapshot_ids,
+        expires_at=expires_at,
+        max_reads=max_reads,
+        reads_used=reads_used,
+        remaining_reads=remaining,
+        rotated_at=rotated_at,
+        items=items,
+    )
+
+
+def _replay_rotation(record: CredentialRotation) -> CredentialRotationResponse:
+    """相同（原凭证, 请求标识）重试：原样回放首次换发结果，不再次换发。"""
+    response = CredentialRotationResponse.model_validate(record.response_payload)
+    response.replayed = True
+    return response
+
+
+def _rotate_token(
+    db: Session, snapshot_id: UUID, request_id: str, old_credential: str
+) -> CredentialRotationResponse:
+    """单快照令牌换发：新令牌继承快照范围、原绝对到期时刻与已用次数。"""
+    # 锁序与公开读取一致：先快照行、再凭证行，避免与并发读取形成死锁；
+    # 换发等待快照锁期间，先提交的读取按既有规则计入旧令牌并被新令牌继承。
+    snapshot = db.execute(
+        select(Snapshot).where(Snapshot.id == snapshot_id).with_for_update()
+    ).scalar_one_or_none()
+    read_token = db.execute(
+        select(ReadToken)
+        .where(ReadToken.token == old_credential)
+        .with_for_update()
+        # 锁可能在队列中等待并发读取/换发提交：必须刷新为当前已提交版本，
+        # 否则会读到定位阶段缓存的旧 rotated_at/reads_used（identity map）。
+        .execution_options(populate_existing=True)
+    ).scalar_one()
+
+    prior = db.execute(
+        select(CredentialRotation).where(
+            CredentialRotation.old_credential == old_credential,
+            CredentialRotation.request_id == request_id,
+        )
+    ).scalar_one_or_none()
+    if prior is not None:
+        db.rollback()
+        return _replay_rotation(prior)
+
+    # 仅未撤销、未换发、未到期且额度未耗尽的凭证可换发。
+    # 快照是否已撤回不作为换发条件（撤回快照的令牌仍可换发，只是继续读不到正文）。
+    if read_token.revoked_at is not None:
+        _rotation_conflict("revoked")
+    if read_token.rotated_at is not None:
+        # 不同请求标识对同一原凭证的换发：仅一次成功，落选方在此冲突
+        _rotation_conflict("already_rotated")
+    now = datetime.now(timezone.utc)
+    if read_token.expires_at is not None and read_token.expires_at <= now:
+        _rotation_conflict("expired")
+    if (
+        read_token.max_reads is not None
+        and read_token.reads_used >= read_token.max_reads
+    ):
+        _rotation_conflict("quota_exhausted")
+
+    rotated_at = now
+    new_token = ReadToken(
+        token=secrets.token_urlsafe(32),
+        snapshot_id=read_token.snapshot_id,
+        expires_at=read_token.expires_at,  # 继承原绝对到期时刻，不延长
+        max_reads=read_token.max_reads,
+        reads_used=read_token.reads_used,  # 继承已用次数，不重置
+        chain_id=read_token.chain_id,  # 继承稳定换发链标识：多代读取归于同一链
+    )
+    db.add(new_token)
+    db.flush()
+    read_token.rotated_at = rotated_at  # 旧令牌换发提交后不能再读取
+    payload = _rotation_payload(
+        kind=ROTATION_KIND_TOKEN,
+        request_id=request_id,
+        old_credential=old_credential,
+        new_credential=new_token.token,
+        snapshot_ids=[read_token.snapshot_id],
+        expires_at=read_token.expires_at,
+        max_reads=read_token.max_reads,
+        reads_used=read_token.reads_used,
+        rotated_at=rotated_at,
+    )
+    db.add(
+        CredentialRotation(
+            kind=ROTATION_KIND_TOKEN,
+            old_credential=old_credential,
+            new_credential=new_token.token,
+            request_id=request_id,
+            response_payload=payload.model_dump(mode="json"),
+        )
+    )
+    db.commit()
+    return payload
+
+
+def _rotate_bundle(
+    db: Session, bundle_id: UUID, request_id: str, old_credential: str
+) -> CredentialRotationResponse:
+    """多快照共享凭证换发：新凭证继承冻结清单、原到期时刻与已用共享额度。
+
+    清单中个别快照已撤回时仍可换发：新凭证复制冻结清单，撤回项继续不可读、
+    读取该项仍不扣共享额度，其他项继续可读。
+    """
+    frozen_items = (
+        db.execute(
+            select(ReadBundleItem)
+            .where(ReadBundleItem.bundle_id == bundle_id)
+            .order_by(ReadBundleItem.position)
+        )
+        .scalars()
+        .all()
+    )
+    snapshot_ids = [item.snapshot_id for item in frozen_items]
+    # 先按清单快照行加锁（排序保证加锁顺序一致），再锁凭证行：
+    # 与公开读取的“快照行锁 → 共享额度条件 UPDATE”同序，串行化而不死锁。
+    snapshots = (
+        db.execute(
+            select(Snapshot)
+            .where(Snapshot.id.in_(snapshot_ids))
+            .order_by(Snapshot.id)
+            .with_for_update()
+        )
+        .scalars()
+        .all()
+    )
+    by_id = {snapshot.id: snapshot for snapshot in snapshots}
+    bundle = db.execute(
+        select(ReadBundle)
+        .where(ReadBundle.id == bundle_id)
+        .with_for_update()
+        # 获得行锁后刷新为当前已提交版本（等待锁期间可能有读取扣次或换发完成）
+        .execution_options(populate_existing=True)
+    ).scalar_one()
+
+    prior = db.execute(
+        select(CredentialRotation).where(
+            CredentialRotation.old_credential == old_credential,
+            CredentialRotation.request_id == request_id,
+        )
+    ).scalar_one_or_none()
+    if prior is not None:
+        db.rollback()
+        return _replay_rotation(prior)
+
+    if bundle.revoked_at is not None:
+        _rotation_conflict("revoked")
+    if bundle.rotated_at is not None:
+        _rotation_conflict("already_rotated")
+    now = datetime.now(timezone.utc)
+    if bundle.expires_at is not None and bundle.expires_at <= now:
+        _rotation_conflict("expired")
+    if bundle.reads_used >= bundle.max_reads:
+        _rotation_conflict("quota_exhausted")
+
+    rotated_at = now
+    new_bundle = ReadBundle(
+        credential=secrets.token_urlsafe(32),
+        max_reads=bundle.max_reads,
+        reads_used=bundle.reads_used,  # 继承已用共享额度，不重置
+        expires_at=bundle.expires_at,  # 继承原绝对到期时刻
+        chain_id=bundle.chain_id,  # 继承稳定换发链标识：多代共享凭证归于同一链
+    )
+    db.add(new_bundle)
+    db.flush()
+    for item in frozen_items:
+        db.add(
+            ReadBundleItem(
+                bundle_id=new_bundle.id,
+                snapshot_id=item.snapshot_id,
+                position=item.position,
+            )
+        )
+    bundle.rotated_at = rotated_at
+    response_items = [
+        RotationBundleItem(
+            snapshot_id=item.snapshot_id,
+            record_id=by_id[item.snapshot_id].record_id,
+            version=by_id[item.snapshot_id].version,
+            position=item.position,
+            status=_snapshot_status(by_id[item.snapshot_id]),
+            withdrawn_at=by_id[item.snapshot_id].withdrawn_at,
+        )
+        for item in frozen_items
+    ]
+    payload = _rotation_payload(
+        kind=ROTATION_KIND_BUNDLE,
+        request_id=request_id,
+        old_credential=old_credential,
+        new_credential=new_bundle.credential,
+        snapshot_ids=snapshot_ids,
+        expires_at=bundle.expires_at,
+        max_reads=bundle.max_reads,
+        reads_used=bundle.reads_used,
+        rotated_at=rotated_at,
+        items=response_items,
+    )
+    db.add(
+        CredentialRotation(
+            kind=ROTATION_KIND_BUNDLE,
+            old_credential=old_credential,
+            new_credential=new_bundle.credential,
+            request_id=request_id,
+            response_payload=payload.model_dump(mode="json"),
+        )
+    )
+    db.commit()
+    return payload
+
+
+@app.post(
+    "/credentials/rotate",
+    response_model=CredentialRotationResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def rotate_credential(
+    payload: CredentialRotateRequest, db: Session = Depends(get_db)
+):
+    """读取凭证疑似泄露时换发：单快照令牌或多快照共享凭证同一入口。
+
+    维护人员凭服务密钥提交（原凭证, 请求标识）：
+    - 仅未撤销、未到期且额度未耗尽的凭证可换发；新凭证继承原范围（适用快照/
+      冻结清单）、原绝对到期时刻与已用次数，旧凭证换发提交后不能再读取；
+    - 相同原凭证与请求标识重试 -> 原样返回首次换发结果（replayed=true），
+      不再次换发；不同请求标识并发/重复换发仅一次成功，其余 409；
+    - 换发与同时进行的成功读取按事务先后结算（快照行锁串行化），
+      不重置也不超支额度；
+    - 未知凭证 404；共享清单中个别快照已撤回仍可换发，该项继续不可读。
+    """
+    old_credential = payload.credential
+    request_id = payload.request_id
+    # 先以普通读定位凭证及其类型（随后在类型分支内按“先快照后凭证”顺序加锁）
+    read_token = db.execute(
+        select(ReadToken).where(ReadToken.token == old_credential)
+    ).scalar_one_or_none()
+    if read_token is not None:
+        return _rotate_token(db, read_token.snapshot_id, request_id, old_credential)
+    bundle = db.execute(
+        select(ReadBundle).where(ReadBundle.credential == old_credential)
+    ).scalar_one_or_none()
+    if bundle is not None:
+        return _rotate_bundle(db, bundle.id, request_id, old_credential)
+    db.rollback()
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND, detail="credential not found"
+    )
+
+
+@app.post(
+    "/tokens/{token}/revoke",
+    response_model=RevokeResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def revoke_token(token: str, db: Session = Depends(get_db)):
+    """撤销令牌：单条原子 UPDATE，提交后新开始的读取一律拒绝。"""
+    result = db.execute(
+        update(ReadToken)
+        .where(ReadToken.token == token, ReadToken.revoked_at.is_(None))
+        .values(revoked_at=func.now())
+    )
+    db.commit()
+    if result.rowcount:
+        return RevokeResponse(token=token, revoked=True, already_revoked=False)
+    if db.get(ReadToken, token) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="token not found")
+    return RevokeResponse(token=token, revoked=True, already_revoked=True)
+
+
+@app.get(
+    "/tokens/{token}",
+    response_model=TokenStatusResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def get_token_status(token: str, db: Session = Depends(get_db)):
+    """维护侧查询令牌的读取次数上限、已用与剩余次数（绝不返回快照原文）。"""
+    read_token = db.get(ReadToken, token)
+    if read_token is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="token not found")
+    snapshot = db.get(Snapshot, read_token.snapshot_id)
+    now = datetime.now(timezone.utc)
+    expired = read_token.expires_at is not None and read_token.expires_at <= now
+    exhausted = (
+        read_token.max_reads is not None and read_token.reads_used >= read_token.max_reads
+    )
+    remaining = (
+        None
+        if read_token.max_reads is None
+        else max(read_token.max_reads - read_token.reads_used, 0)
+    )
+    return TokenStatusResponse(
+        token=read_token.token,
+        snapshot_id=read_token.snapshot_id,
+        record_id=snapshot.record_id,
+        version=snapshot.version,
+        created_at=read_token.created_at,
+        expires_at=read_token.expires_at,
+        revoked_at=read_token.revoked_at,
+        rotated_at=read_token.rotated_at,
+        max_reads=read_token.max_reads,
+        reads_used=read_token.reads_used,
+        remaining_reads=remaining,
+        active=(
+            read_token.revoked_at is None
+            and read_token.rotated_at is None
+            and not expired
+            and not exhausted
+        ),
+    )
+
+
+@app.post(
+    "/snapshots/{snapshot_id}/withdraw",
+    response_model=SnapshotWithdrawResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def withdraw_snapshot(
+    snapshot_id: UUID,
+    payload: SnapshotWithdrawRequest = Body(default_factory=SnapshotWithdrawRequest),
+    db: Session = Depends(get_db),
+):
+    """将快照永久撤回：记录首次撤回时间与原因，重复撤回返回首次结果。
+
+    - 未知快照 -> 404；缺失/错误服务密钥 -> 401；
+    - 首次撤回必须提供非空白原因 -> 422；
+    - 快照行锁先于一切状态判定：到点的定时撤回计划在同一事务惰性结算
+      （撤回时间取预定时刻、原因取计划原因），故“计划先到点”时本次调用只
+      回放首次结果，不能改写原因；
+    - 快照仍公开且计划尚未到点时：以当前时刻与本次原因完成手动撤回，并在同一
+      事务把有效计划置为 superseded——手动撤回先发生时以手动撤回时间和原因为准；
+    - 并发手动撤回由快照行锁串行化，恰好一个首次结果。
+    """
+    snapshot = db.execute(
+        select(Snapshot).where(Snapshot.id == snapshot_id).with_for_update()
+    ).scalar_one_or_none()
+    if snapshot is None:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="snapshot not found"
+        )
+    now = datetime.now(timezone.utc)
+    # 先在快照行锁内结算到点计划：计划先到时快照在此变为已撤回（原因=计划原因）
+    _settle_snapshot_withdrawal_plans(db, snapshot, now)
+    if snapshot.withdrawn_at is not None:
+        # 计划到点（或此前已撤回）：回放首次撤回时间与原因，绝不改写；
+        # 先提交可能在本轮完成的到期结算。
+        db.commit()
+        withdrawn_at = snapshot.withdrawn_at
+    elif not (payload.reason and payload.reason.strip()):
+        # 快照仍公开、手动撤回缺原因：422，不撤回、不改变有效计划
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="reason is required when withdrawing a snapshot",
+        )
+    else:
+        # 手动撤回：撤回时间与原因以本次提交为准，并终止尚未到点的有效计划
+        snapshot.withdrawn_at = now
+        snapshot.withdraw_reason = payload.reason
+        _settle_snapshot_withdrawal_plans(db, snapshot, now)  # 终止 pending 计划
+        db.commit()
+        withdrawn_at = now
+    return SnapshotWithdrawResponse(
+        snapshot_id=snapshot_id,
+        withdrawn_at=withdrawn_at,
+        status=SNAPSHOT_WITHDRAWN_STATUS,
+    )
+
+
+# ---- 快照定时永久撤回计划（机构维护侧：安排 / 查询 / 取消） ----
+
+
+def _plan_info(plan: SnapshotWithdrawalPlan) -> SnapshotWithdrawalPlanInfo:
+    """组装计划详情：completed 时 withdrawn_at 取终结时刻（即预定时刻），其余为 null。"""
+    withdrawn_at = (
+        plan.ended_at if plan.status == WITHDRAWAL_PLAN_COMPLETED else None
+    )
+    return SnapshotWithdrawalPlanInfo(
+        plan_id=plan.id,
+        snapshot_id=plan.snapshot_id,
+        status=plan.status,
+        scheduled_at=plan.scheduled_at,
+        reason=plan.reason,
+        created_at=plan.created_at,
+        ended_at=plan.ended_at,
+        withdrawn_at=withdrawn_at,
+    )
+
+
+@app.post(
+    "/snapshot-withdrawal-plans",
+    response_model=SnapshotWithdrawalPlanCreateResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_service_key)],
+)
+def create_snapshot_withdrawal_plan(
+    payload: SnapshotWithdrawalPlanCreate, db: Session = Depends(get_db)
+):
+    """为已发布快照安排一次未来的永久撤回。
+
+    维护人员凭服务密钥提交快照标识、带时区且晚于服务端当前时刻的撤回时间与
+    非空原因。
+
+    - 未知快照 -> 404；已撤回快照（含到点计划刚结算的）-> 409；缺/错密钥 -> 401；
+    - 预定时刻缺时区 -> 422（请求 schema）；不晚于服务端当前时刻 -> 422；
+      空白原因 -> 422；
+    - 同一快照同时只能有一个有效（pending）计划：
+      - 已存在有效计划且预定时刻与原因完全相同 -> 视为重复提交，返回 200 与
+        原计划（replayed=true，不新建）；
+      - 已存在有效计划但时间或原因不同 -> 409，须先取消原计划再重新安排；
+    - 到点的旧计划在快照行锁内先惰性结算，再按已撤回快照处理（409）；
+    - 并发安排由快照行锁 + “每快照至多一个 pending 计划”的部分唯一索引串行化，
+      恰好建立一个有效计划。
+    """
+    scheduled_at = payload.scheduled_at.astimezone(timezone.utc)
+    snapshot = db.execute(
+        select(Snapshot).where(Snapshot.id == payload.snapshot_id).with_for_update()
+    ).scalar_one_or_none()
+    if snapshot is None:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="snapshot not found"
+        )
+    now = datetime.now(timezone.utc)
+    # 到点计划先结算（“计划先到时”由其完成撤回，重复安排按已撤回快照 409）
+    _settle_snapshot_withdrawal_plans(db, snapshot, now)
+    if snapshot.withdrawn_at is not None:
+        # 可能是本轮到期结算刚生效：先提交结算，再按已撤回快照拒绝
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="snapshot has already been withdrawn",
+        )
+    if scheduled_at <= now:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="scheduled_at must be later than the server's current time",
+        )
+    active = db.execute(
+        select(SnapshotWithdrawalPlan)
+        .where(
+            SnapshotWithdrawalPlan.snapshot_id == snapshot.id,
+            SnapshotWithdrawalPlan.status == WITHDRAWAL_PLAN_PENDING,
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
+    if active is not None:
+        if active.scheduled_at == scheduled_at and active.reason == payload.reason:
+            # 重复提交相同内容：原样回放已有有效计划，不新建、不改变任何状态
+            response = SnapshotWithdrawalPlanCreateResponse(
+                **_plan_info(active).model_dump(), replayed=True
+            )
+            db.rollback()  # 只读回放，释放快照行锁
+            return JSONResponse(status_code=status.HTTP_200_OK, content=response.model_dump(mode="json"))
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "an active withdrawal plan already exists for this snapshot; "
+                "cancel it before scheduling a different time or reason",
+                "plan_id": str(active.id),
+                "scheduled_at": active.scheduled_at.isoformat(),
+            },
+        )
+    plan = SnapshotWithdrawalPlan(
+        snapshot_id=snapshot.id,
+        scheduled_at=scheduled_at,
+        reason=payload.reason,
+        created_at=now,
+    )
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+    return SnapshotWithdrawalPlanCreateResponse(**_plan_info(plan).model_dump(), replayed=False)
+
+
+@app.get(
+    "/snapshot-withdrawal-plans/{plan_id}",
+    response_model=SnapshotWithdrawalPlanInfo,
+    dependencies=[Depends(require_service_key)],
+)
+def get_snapshot_withdrawal_plan(plan_id: UUID, db: Session = Depends(get_db)):
+    """查询定时撤回计划（服务密钥）。
+
+    返回计划编号、快照、状态、预定时刻、原因、创建与终结时刻。计划查询在
+    快照行锁内先做到期结算：到点计划立刻反映为 completed 且快照已撤回。
+    未知计划 -> 404，缺/错密钥 -> 401。
+    """
+    plan = db.get(SnapshotWithdrawalPlan, plan_id)
+    if plan is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="withdrawal plan not found"
+        )
+    if plan.status == WITHDRAWAL_PLAN_PENDING:
+        # 固定锁序“快照行 -> 计划行”：与结算/取消/手动撤回串行化，无锁序环
+        snapshot = db.execute(
+            select(Snapshot).where(Snapshot.id == plan.snapshot_id).with_for_update()
+        ).scalar_one()
+        db.execute(
+            select(SnapshotWithdrawalPlan)
+            .where(SnapshotWithdrawalPlan.id == plan.id)
+            .with_for_update()
+        ).scalar_one()
+        _settle_snapshot_withdrawal_plans(db, snapshot, datetime.now(timezone.utc))
+        db.commit()
+        db.refresh(plan)
+    return _plan_info(plan)
+
+
+@app.post(
+    "/snapshot-withdrawal-plans/{plan_id}/cancel",
+    response_model=SnapshotWithdrawalPlanCancelResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def cancel_snapshot_withdrawal_plan(plan_id: UUID, db: Session = Depends(get_db)):
+    """在定时撤回计划生效前取消它（服务密钥）。
+
+    - 仅 pending 计划可取消：取消在快照行锁内先做到期结算，计划恰在此时到点
+      则结算生效（completed、快照撤回），本次取消明确拒绝（409）；
+    - 已完成（已生效）/已取消/已被手动撤回终止（superseded）的计划一律 409，
+      不改变任何状态；
+    - 未知计划 -> 404，缺/错密钥 -> 401。取消后同一快照可重新安排计划。
+    """
+    plan = db.get(SnapshotWithdrawalPlan, plan_id)
+    if plan is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="withdrawal plan not found"
+        )
+    snapshot = db.execute(
+        select(Snapshot).where(Snapshot.id == plan.snapshot_id).with_for_update()
+    ).scalar_one()
+    db.execute(
+        select(SnapshotWithdrawalPlan)
+        .where(SnapshotWithdrawalPlan.id == plan.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one()
+    now = datetime.now(timezone.utc)
+    # 到期结算优先：到点即撤回，取消不得再生效
+    _settle_snapshot_withdrawal_plans(db, snapshot, now)
+    # autoflush=False：先 flush 把结算中对计划行的改写落库，再从库内重载计划行——
+    # 结算的 supersede 分支是 Core 批量 UPDATE，不会同步本会话身份映射中的对象，
+    # 必须以库内（本事务内）最新状态判定取消资格，不能用可能过期的 plan.status。
+    db.flush()
+    db.refresh(plan)
+    if plan.status != WITHDRAWAL_PLAN_PENDING:
+        # 可能是本轮结算刚让计划到点生效：先提交结算，再拒绝取消
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "withdrawal plan is no longer active and cannot be cancelled",
+                "status": plan.status,
+            },
+        )
+    plan.status = WITHDRAWAL_PLAN_CANCELLED
+    plan.ended_at = now
+    db.commit()
+    db.refresh(plan)
+    return SnapshotWithdrawalPlanCancelResponse(**_plan_info(plan).model_dump())
+
+
+@app.get(
+    "/records/{record_id}",
+    response_model=RecordStatusResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def get_record(record_id: UUID, db: Session = Depends(get_db)):
+    """维护侧查看记录当前版本、受控标记与已发布快照列表。"""
+    record = db.get(Record, record_id)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="record not found")
+    snapshots = (
+        db.execute(
+            select(Snapshot).where(Snapshot.record_id == record_id).order_by(Snapshot.version)
+        )
+        .scalars()
+        .all()
+    )
+    return RecordStatusResponse(
+        record_id=record.id,
+        current_version=record.current_version,
+        controlled=record.controlled,
+        snapshots=[
+            SnapshotInfo(
+                snapshot_id=s.id,
+                version=s.version,
+                status=_snapshot_status(s),
+                published_at=s.published_at,
+                withdrawn_at=s.withdrawn_at,
+                withdraw_reason=s.withdraw_reason,
+                window_open_at=s.window_open_at,
+                window_close_at=s.window_close_at,
+            )
+            for s in snapshots
+        ],
+    )
+
+
+# ---- 记录临时冻结（维护侧；覆盖该记录现有及期间新发布的全部快照） ----
+
+
+def _freeze_status_response(freeze: RecordFreeze | None, record_id: UUID) -> RecordFreezeStatus:
+    """组装当前冻结期状态：无当前冻结期时各字段为 null（原因仅维护侧可见）。"""
+    if freeze is None:
+        return RecordFreezeStatus(record_id=record_id, frozen=False)
+    return RecordFreezeStatus(
+        record_id=record_id,
+        frozen=True,
+        frozen_at=freeze.frozen_at,
+        reason=freeze.reason,
+        unfrozen_at=None,
+    )
+
+
+@app.post(
+    "/records/{record_id}/freeze",
+    response_model=RecordFreezeResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def freeze_record(
+    record_id: UUID,
+    payload: RecordFreezeRequest = Body(default_factory=RecordFreezeRequest),
+    db: Session = Depends(get_db),
+):
+    """临时冻结记录：冻结覆盖该记录现有及冻结期间新发布的全部快照。
+
+    - 凭维护密钥提交记录标识与非空白原因：未知记录 404、空白原因 422、
+      缺失/错误密钥 401；
+    - 幂等：记录已在冻结期时重复冻结（无论是否带原因）原样回放当前冻结期，
+      返回 already_frozen=true，当前冻结期的原因与开始时间绝不被覆盖；
+    - 记录行行锁 + “每条记录至多一个未解除冻结期”的部分唯一索引串行化并发
+      冻结，恰好一个首次结果；
+    - 冻结提交后开始的公开读取（即使持有效单快照令牌或共享凭证）一律按既有
+      “snapshot unavailable”拒绝，不扣次数、不写成功读取审计；冻结原因只在
+      维护侧响应中出现，公开侧的模糊 403 绝不透露它。
+    """
+    # 先锁记录行再判定当前冻结期：与并发冻结/解除及公开读取的记录锁串行化，
+    # 保证提交边界一致——冻结提交后才拿到记录锁的读取必定看到冻结。
+    record = db.execute(
+        select(Record).where(Record.id == record_id).with_for_update()
+    ).scalar_one_or_none()
+    if record is None:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="record not found")
+    active = db.execute(
+        select(RecordFreeze)
+        .where(RecordFreeze.record_id == record_id, RecordFreeze.unfrozen_at.is_(None))
+        .with_for_update()
+    ).scalar_one_or_none()
+    if active is not None:
+        # 已在冻结期：幂等回放，绝不覆盖原因与开始时间（不校验本次原因）。
+        response = RecordFreezeResponse(
+            **_freeze_status_response(active, record_id).model_dump(),
+            already_frozen=True,
+        )
+        db.rollback()  # 释放记录行锁，状态未被改变
+        return response
+    if not (payload.reason and payload.reason.strip()):
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="reason is required when freezing a record",
+        )
+    freeze = RecordFreeze(reason=payload.reason, record_id=record_id)
+    db.add(freeze)
+    db.commit()
+    db.refresh(freeze)
+    return RecordFreezeResponse(
+        **_freeze_status_response(freeze, record_id).model_dump(),
+        already_frozen=False,
+    )
+
+
+@app.post(
+    "/records/{record_id}/unfreeze",
+    response_model=RecordUnfreezeResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def unfreeze_record(record_id: UUID, db: Session = Depends(get_db)):
+    """解除记录冻结：只恢复原本仍有效的读取资格，幂等且不复活任何失效凭证。
+
+    - 未知记录 404；记录当前未冻结时重复解除返回 frozen=false、
+      already_unfrozen=true（状态不被改变）；
+    - 条件 UPDATE 只命中未解除的冻结行：与并发解除串行化，恰好一个首次结果；
+    - 解除不复活冻结期间已撤回的快照、已过期/撤销/换发的凭证或已耗尽的额度：
+      公开读取仍按既有规则各自判定。
+    """
+    if db.get(Record, record_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="record not found")
+    unfrozen_at = db.execute(
+        update(RecordFreeze)
+        .where(RecordFreeze.record_id == record_id, RecordFreeze.unfrozen_at.is_(None))
+        .values(unfrozen_at=func.now())
+        .returning(RecordFreeze.unfrozen_at)
+    ).scalar_one_or_none()
+    if unfrozen_at is None:
+        # 当前没有冻结期：重复解除幂等，不改变状态
+        db.rollback()
+        return RecordUnfreezeResponse(
+            record_id=record_id, frozen=False, unfrozen_at=None, already_unfrozen=True
+        )
+    db.commit()
+    return RecordUnfreezeResponse(
+        record_id=record_id,
+        frozen=False,
+        unfrozen_at=unfrozen_at,
+        already_unfrozen=False,
+    )
+
+
+@app.get(
+    "/records/{record_id}/freeze",
+    response_model=RecordFreezeStatus,
+    dependencies=[Depends(require_service_key)],
+)
+def get_record_freeze(record_id: UUID, db: Session = Depends(get_db)):
+    """维护侧查询记录当前冻结状态：未冻结时 frozen=false、其余字段为 null。
+
+    只返回当前冻结期的开始时间、原因与（冻结中恒为 null 的）解除时间；
+    历史冻结期在库内留存但不展开。未知记录 404，缺失/错误密钥 401。
+    """
+    if db.get(Record, record_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="record not found")
+    active = db.execute(
+        select(RecordFreeze)
+        .where(RecordFreeze.record_id == record_id, RecordFreeze.unfrozen_at.is_(None))
+        .order_by(RecordFreeze.frozen_at.desc())
+    ).scalar_one_or_none()
+    return _freeze_status_response(active, record_id)
+
+
+# ---- 历史版本原文销毁（机构维护侧：原子清除版本原文与全部申请冻结原文） ----
+
+
+@app.post(
+    "/records/{record_id}/versions/{version}/destroy-original",
+    response_model=VersionOriginalDestroyResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def destroy_version_original(
+    record_id: UUID,
+    version: int,
+    payload: VersionOriginalDestroyRequest = Body(default_factory=VersionOriginalDestroyRequest),
+    db: Session = Depends(get_db),
+):
+    """销毁指定历史版本不再应留存的原文（版本行、脱敏区间与申请状态全部保留）。
+
+    - 凭服务密钥提交非空白理由：未知记录/版本 404、空白理由 422、缺/错密钥 401；
+    - 首次操作在同一事务内原子完成：
+      1. 锁定该版本行（版本行是发布/申请提交与销毁共用的串行点），再锁定
+         该版本全部受控申请行；锁序恒为“版本行 -> 申请行”，不锁记录行——
+         记录行的 FOR UPDATE 是公开读取在快照行之后才获取的锁，销毁不碰它，
+         因此与读取“快照行 -> 记录行”以及批准“申请行 -> （插入新快照）快照行
+         -> 记录行 KEY SHARE”都不会形成锁序环；
+      2. 清除 record_versions.original_text 与该版本全部受控发布申请
+         （pending/approved/rejected）冻结的 publish_requests.frozen_text；
+      3. 写入 (record_id, version) 唯一的销毁登记（首次销毁时间与原因）；
+    - 重复操作原样回放首次销毁时间与原因（replayed=true），不再次改写；
+    - 销毁提交后，该版本的直接发布、受控申请提交与待审申请批准一律 409，
+      待审申请仍可驳回；其他版本的修订与发布不受影响；
+    - 与发布/申请提交/批准并发时按事务提交顺序生效：先提交者按原状态完成，
+      后提交者看到销毁结果；销毁后不残留任何可用于签发的原文副本；
+    - 既有脱敏快照、读取凭证、额度、成功读取审计与公开读取约定保持不变，
+      公开响应不透露销毁状态。
+    """
+    # 记录永不删除：普通读判定存在性即可，不在销毁中持有记录行锁（见 docstring）。
+    if db.get(Record, record_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="record not found")
+    # 关键串行点：先锁版本行。直接发布/申请提交都先取同一版本行 FOR UPDATE，
+    # 销毁先提交则它们获锁后看到 original_text 为 NULL 并 409；它们先提交则
+    # 销毁随后获锁清除原文（先签发的快照已不可变，其令牌仍有效）。
+    record_version = db.execute(
+        select(RecordVersion)
+        .where(RecordVersion.record_id == record_id, RecordVersion.version == version)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if record_version is None:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="record version not found"
+        )
+    # 终态回放在版本行锁内判定：登记行存在即已销毁，读回首次结果，
+    # 不校验/覆盖本次原因（并发重复销毁在版本行锁上串行，恰好一个首次）。
+    destruction = db.execute(
+        select(VersionOriginalDestruction)
+        .where(
+            VersionOriginalDestruction.record_id == record_id,
+            VersionOriginalDestruction.version == version,
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
+    if destruction is not None:
+        response = VersionOriginalDestroyResponse(
+            record_id=record_id,
+            version=version,
+            destroyed_at=destruction.destroyed_at,
+            reason=destruction.reason,
+            replayed=True,
+        )
+        db.rollback()  # 终态回放，不持有锁、不改写任何内容
+        return response
+    if not (payload.reason and payload.reason.strip()):
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="reason is required when destroying a version original",
+        )
+    now = datetime.now(timezone.utc)
+    # 原子清除版本原文。
+    record_version.original_text = None
+    # 锁定并清除该版本全部受控申请冻结的原文（含 pending 与终态）：
+    # 待审申请保留 pending 状态，只能再驳回；已批准/驳回申请保留其终态。
+    # 申请行锁与批准/驳回持有的申请行锁互斥：批准先提交则按冻结原文完成签发
+    # （其 frozen_text 随后被本次销毁清除）；销毁先提交则后来的批准看到
+    # frozen_text 为 NULL 并 409。
+    publish_requests = (
+        db.execute(
+            select(PublishRequestModel)
+            .where(
+                PublishRequestModel.record_id == record_id,
+                PublishRequestModel.version == version,
+            )
+            .with_for_update()
+        )
+        .scalars()
+        .all()
+    )
+    for publish_request in publish_requests:
+        publish_request.frozen_text = None
+    destruction = VersionOriginalDestruction(
+        record_id=record_id,
+        version=version,
+        reason=payload.reason,
+        destroyed_at=now,
+    )
+    db.add(destruction)
+    db.commit()
+    db.refresh(destruction)
+    return VersionOriginalDestroyResponse(
+        record_id=record_id,
+        version=version,
+        destroyed_at=destruction.destroyed_at,
+        reason=destruction.reason,
+        replayed=False,
+    )
+
+
+# ---- 敏感短语清单（机构维护侧：原子替换 + 查询；发布与申请提交/批准均核验） ----
+
+
+def _sensitive_phrase_list_response(row: SensitivePhraseSettings) -> SensitivePhraseListResponse:
+    """组装清单响应：空清单 enabled=false（停用核验）；只返回清单本身与版本元数据。"""
+    phrases = list(row.phrases or [])
+    return SensitivePhraseListResponse(
+        version=row.version,
+        phrases=phrases,
+        enabled=bool(phrases),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+@app.get(
+    "/sensitive-phrases",
+    response_model=SensitivePhraseListResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def get_sensitive_phrases(db: Session = Depends(get_db)):
+    """查询当前启用的敏感短语清单（服务密钥）。
+
+    返回清单版本、短语数组、enabled 标志与时间元数据；空清单（[]）且
+    enabled=false 表示当前停用核验。缺/错密钥 401。
+    """
+    row = db.get(SensitivePhraseSettings, SENSITIVE_PHRASE_SETTINGS_ID)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="sensitive phrase settings are not initialized",
+        )
+    return _sensitive_phrase_list_response(row)
+
+
+@app.put(
+    "/sensitive-phrases",
+    response_model=SensitivePhraseListResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def replace_sensitive_phrases(
+    payload: SensitivePhraseReplaceRequest, db: Session = Depends(get_db)
+):
+    """凭服务密钥原子替换当前启用的敏感短语清单。
+
+    - 短语须非空、清单内不得重复（请求体 422）；空清单 [] 表示停用核验；
+    - 整份清单在同一事务替换并把 version +1：并发替换由固定单行的行锁串行化，
+      后提交者在前一已提交版本上继续递增，每次成功替换都是一个新已提交版本；
+    - 与发布并发时，发布事务持有同一行的 FOR UPDATE 锁完成核验与提交，本替换
+      在其提交后才生效，发布按其锁定的同一版本完成，不受本次替换影响；
+    - 缺/错密钥 401。清单变更不改变已发布快照与既有读取凭证。
+    """
+    row = db.execute(
+        select(SensitivePhraseSettings)
+        .where(SensitivePhraseSettings.id == SENSITIVE_PHRASE_SETTINGS_ID)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if row is None:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="sensitive phrase settings are not initialized",
+        )
+    row.phrases = list(payload.phrases)
+    row.version = row.version + 1
+    row.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(row)
+    return _sensitive_phrase_list_response(row)
+
+
+@app.get("/public/snapshots/{snapshot_id}", response_model=PublicSnapshotResponse)
+def read_snapshot(
+    snapshot_id: UUID,
+    token: str = Query(..., description="发布时签发的读取令牌或共享凭证"),
+    db: Session = Depends(get_db),
+):
+    """公开读取：凭有效令牌或多快照共享凭证返回脱敏正文。
+
+    判定时刻一律以**全部相关行锁取齐之后**的服务端时刻 now 为准（“先取锁、
+    后取时”）：请求取得快照行锁后仍可能在记录/冻结行锁（并发冻结、解除）与
+    凭证行锁（并发成功读取、撤销、换发）上排队等待，等待可能跨过阅览时段截止、
+    凭证到期或定时撤回计划到点。绝不能用任何一把行锁等待前缓存的时刻做资格
+    判定——获锁后统一按新时刻判定：已失效的请求沿用同一模糊 403，不扣次数、
+    不写成功审计；等待期间到点的定时撤回计划在快照行锁内先按预定时刻与计划
+    原因完成撤回结算并提交，再按“已撤回快照”返回 403。
+
+    固定加锁顺序为“快照行 → 记录行 → 冻结行 → 凭证行（令牌或共享凭证）”，
+    与换发、撤回、冻结等事务保持同序，不引入死锁环。凭证行先以 FOR UPDATE
+    锁住（单令牌须同属本快照，共享凭证须其冻结清单覆盖本快照），使等待结束后
+    读到的撤销/换发/到期/已用次数都是已提交的最新状态；不存在或不匹配的候选
+    不持凭证锁，最终统一落入模糊 403。
+
+    先对快照行加锁再判定有效性，使读取与永久撤回由数据库行锁串行化：
+    撤回提交后才开始的读取在此看到 withdrawn_at 非空，直接返回模糊 403，
+    既不返回正文也不递增任何计数（不消耗任何额度）。
+
+    随后对该快照所属记录的行加锁并核对当前冻结期，使读取与临时冻结/解除
+    同样串行化：冻结提交后才开始的读取在此看到未解除冻结期，沿用与撤回完全
+    一致的模糊 403（不透露冻结或原因），不扣次数、不写成功读取审计；解除提交
+    后开始的读取按各自凭证的既有资格继续判定。冻结覆盖该记录现有及冻结期间
+    新发布的全部快照；共享凭证中属于其他记录的快照不受影响、仍可读取。
+
+    外部阅览时段（随快照首次发布固定，不可变）：带时段的快照仅在
+    [window_open_at, window_close_at) 内可读取——开放时刻起含、截止时刻前不含，
+    一律以获锁后的服务端时刻为准；开放前或截止后的读取沿用同一模糊 403，
+    不扣次数、不写成功读取审计。时段是每快照属性：同一条共享凭证读取清单内
+    其他快照不受窗口外快照影响。无时段快照（维护侧两字段均为 null）不受限制。
+
+    单快照令牌：凭证行锁内按获锁后的 now 复核未撤销、未换发、未到期与
+    （不限次或 reads_used < max_reads）后递增，行锁串行化并发读取。
+
+    多快照共享凭证：额外要求该快照在凭证绑定清单内（凭证行锁定条件即带此
+    约束），且凭证未撤销、未换发、未到期、共享额度未耗尽，再在同一凭证行锁内
+    递增：
+    - 凭证不存在、清单不匹配、快照不在清单内、已撤销、已到期、额度耗尽 ->
+      统一返回模糊 403，且这些请求不消耗共享额度；
+    - 清单内某项快照后来被撤回：只拒绝该项（快照行锁阶段即 403），不扣额度，
+      其他项仍可凭同一凭证读取；
+    - 到期、撤销或额度耗尽时全部拒绝。
+
+    每次成功读取（无论令牌还是共享凭证）都在本次额度扣减的同一事务内追加一条
+    不可变审计事件（事件标识、快照、时间、凭证类型与稳定换发链标识，绝无凭证明文）：
+    事件与计数同生共死，任一失败整体回滚；上述所有失败路径在写事件之前即结束，
+    不产生任何审计事件。
+    """
+    snapshot = db.execute(
+        select(Snapshot).where(Snapshot.id == snapshot_id).with_for_update()
+    ).scalar_one_or_none()
+    if snapshot is None:
+        # 不区分“快照不存在 / 已撤回 / 已冻结 / 阅览窗口外 / 令牌或凭证无效 / 已撤销 / 已过期 / 次数用尽 / 不在清单”，
+        # 快照不存在时直接拒绝，不触碰任何读取计数，也不写审计事件。
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
+        )
+    # 锁序恒为“快照行 -> 记录行 -> 冻结行 -> 凭证行”，与冻结/撤回/换发等事务
+    # 保持同序，不引入死锁环。先锁快照所属记录行并在锁内核对当前冻结期：
+    # 冻结操作先锁记录行再插入冻结行，与读取在此串行化；冻结提交后才取齐锁的
+    # 读取必定看到未解除冻结期并模糊拒绝，不扣任何额度、不写成功读取审计。
+    db.execute(
+        select(Record.id).where(Record.id == snapshot.record_id).with_for_update()
+    )
+    active_freeze = db.execute(
+        select(RecordFreeze.id)
+        .where(
+            RecordFreeze.record_id == snapshot.record_id,
+            RecordFreeze.unfrozen_at.is_(None),
+        )
+        .with_for_update()
+        .limit(1)
+    ).first()
+    # 先按“同快照单令牌”候选锁定凭证行（不存在则改查覆盖本快照的共享凭证）：
+    # 凭证行锁取齐后，等待期间发生的撤销/换发/成功扣次在获锁时均已提交可见。
+    # 注意此刻**不读时钟、不做任何时刻相关判定**——now 必须等全部行锁到手再取。
+    read_token = db.execute(
+        select(ReadToken)
+        .where(ReadToken.token == token, ReadToken.snapshot_id == snapshot.id)
+        .with_for_update()
+        .limit(1)
+    ).scalar_one_or_none()
+    read_bundle = None
+    if read_token is None:
+        # 多快照共享凭证候选：仅锁定其冻结清单覆盖本快照的凭证行；清单外凭证
+        # 不在此持锁，最终与其他失效情形统一模糊 403。
+        read_bundle = db.execute(
+            select(ReadBundle)
+            .where(
+                ReadBundle.credential == token,
+                ReadBundle.id.in_(
+                    select(ReadBundleItem.bundle_id).where(
+                        ReadBundleItem.snapshot_id == snapshot.id
+                    )
+                ),
+            )
+            .with_for_update()
+            .limit(1)
+        ).scalar_one_or_none()
+    # 此刻起持有本次读取的全部相关行锁（快照行、记录行、冻结行、凭证行）：
+    # now 是唯一有效的服务端资格判定时刻——任一行锁的等待都可能跨过阅览时段
+    # 截止、凭证到期或定时撤回计划到点，一律按获锁后的新时刻判定，绝不复用旧时间。
+    now = datetime.now(timezone.utc)
+    # 定时撤回计划到点即在此（快照行锁内）惰性结算：结算提交后本次读取按既有
+    # “已撤回快照”路径处理——模糊 403、不扣单令牌或共享凭证额度、不写成功审计。
+    # 计划到点时撤回时间取预定时刻、原因取计划原因；凭证行锁也已先取齐，等待
+    # 凭证行锁期间跨过的到点时刻同样在此被捕获结算。
+    if snapshot.withdrawn_at is None:
+        _settle_snapshot_withdrawal_plans(db, snapshot, now)
+        if snapshot.withdrawn_at is not None:
+            db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
+            )
+    if snapshot.withdrawn_at is not None:
+        # 已撤回（手动撤回或到点计划）：不触碰任何读取计数，也不写审计事件。
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
+        )
+    if active_freeze is not None:
+        # 冻结提交后才取齐行锁的读取：与撤回完全一致的模糊 403，
+        # 不扣任何额度、不写成功审计（解除只恢复原本仍有效的读取资格）。
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
+        )
+    # 外部阅览时段（随快照首次发布固定）：仅在 [window_open_at, window_close_at)
+    # 内放行，开放时刻起含、截止时刻前不含，以获锁后的服务端时刻 now 为准——
+    # 等待记录/冻结/凭证行锁期间跨过截止时刻的请求在此被捕获。窗口外沿用与
+    # 撤回/冻结完全一致的模糊 403：不区分原因，不递增任何计数（不扣单快照令牌
+    # 或共享凭证次数），不写成功读取审计；时段是每快照属性，同凭证清单内其他
+    # 快照不受影响。无时段快照（两列为 NULL）恒通过本检查。
+    if not _window_active(snapshot, now):
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
+        )
+    # 凭证有效性在已锁定的凭证行上按获锁后的 now 复核：行锁等待期间凭证被撤销/
+    # 换发/到期，或额度被并发成功读取耗尽，获锁后看到的都是已提交的最新状态，
+    # 失效即模糊 403（不递增计数、不写审计）。有效时在同一行锁内递增已用次数，
+    # 与随后写入的审计事件同事务原子提交：行锁串行化并发读取，绝不超支额度。
+    credential_kind = None
+    chain_id = None
+    if read_token is not None:
+        if (
+            read_token.revoked_at is not None
+            or read_token.rotated_at is not None
+            or (read_token.expires_at is not None and read_token.expires_at <= now)
+            or (
+                read_token.max_reads is not None
+                and read_token.reads_used >= read_token.max_reads
+            )
+        ):
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
+            )
+        read_token.reads_used += 1
+        credential_kind, chain_id = AUDIT_KIND_TOKEN, read_token.chain_id
+    else:
+        # 多快照共享凭证：成员关系已在凭证行锁定条件内确认；这里只复核撤销/
+        # 换发/到期/共享额度。凭证不存在或快照不在清单内（read_bundle is None）
+        # 与其余失效情形一样统一模糊 403，均不扣共享额度、不写成功审计。
+        if (
+            read_bundle is None
+            or read_bundle.revoked_at is not None
+            or read_bundle.rotated_at is not None
+            or (read_bundle.expires_at is not None and read_bundle.expires_at <= now)
+            or read_bundle.reads_used >= read_bundle.max_reads
+        ):
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
+            )
+        read_bundle.reads_used += 1
+        credential_kind, chain_id = AUDIT_KIND_BUNDLE, read_bundle.chain_id
+    # 成功读取：审计事件与本次额度扣减在同一事务提交（原子）。
+    # 只记录稳定换发链标识，不记录令牌/共享凭证字符串本身。
+    db.add(
+        ReadAuditEvent(
+            snapshot_id=snapshot.id,
+            occurred_at=now,
+            credential_kind=credential_kind,
+            credential_chain_id=chain_id,
+        )
+    )
+    db.commit()
+    return {
+        "record_id": snapshot.record_id,
+        "version": snapshot.version,
+        "status": SNAPSHOT_STATUS,
+        "redacted_text": snapshot.redacted_text,
+    }
+
+
+# ---- 成功读取审计事件的维护侧分页查询（只追加日志，无修改/删除入口） ----
+
+
+# 单次查询最多返回的事件数（防止一次拉取过多）
+AUDIT_MAX_PAGE_LIMIT = 500
+AUDIT_DEFAULT_PAGE_LIMIT = 100
+# 游标体积很小（一个 JSON），但仍限制请求头/查询串的滥用长度
+AUDIT_MAX_CURSOR_CHARS = 2000
+
+
+def _bad_cursor() -> HTTPException:
+    """非法游标一律 422，不透露编码或内容细节。"""
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid cursor"
+    )
+
+
+def _normalize_time_range(start: datetime, end: datetime) -> tuple[datetime, datetime]:
+    """统一为 UTC  aware 时间；左闭右开，且 start < end，否则 422。"""
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    start = start.astimezone(timezone.utc)
+    end = end.astimezone(timezone.utc)
+    if start >= end:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="start must be earlier than end",
+        )
+    return start, end
+
+
+def _encode_cursor(
+    *,
+    snapshot_id: UUID,
+    start: datetime,
+    end: datetime,
+    limit: int,
+    after_seq: int,
+    horizon_seq: int,
+) -> str:
+    """游标承载查询窗口与分页位置；只允许在同一查询的后续页之间流转。"""
+    payload = {
+        "snapshot_id": str(snapshot_id),
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "limit": limit,
+        "after_seq": after_seq,
+        "horizon_seq": horizon_seq,
+    }
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> dict:
+    """解析并做结构校验；任何不符都视为非法游标（422）。"""
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        raw = base64.b64decode(
+            padded.encode("ascii"), altchars=b"-_", validate=True
+        )
+        payload = json.loads(raw.decode("utf-8"))
+    except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
+        raise _bad_cursor() from exc
+    required = ("snapshot_id", "start", "end", "limit", "after_seq", "horizon_seq")
+    if not isinstance(payload, dict) or any(key not in payload for key in required):
+        raise _bad_cursor()
+    try:
+        snapshot_id = UUID(str(payload["snapshot_id"]))
+        start = datetime.fromisoformat(payload["start"])
+        end = datetime.fromisoformat(payload["end"])
+        limit = int(payload["limit"])
+        after_seq = int(payload["after_seq"])
+        horizon_seq = int(payload["horizon_seq"])
+    except (ValueError, TypeError) as exc:
+        raise _bad_cursor() from exc
+    if (
+        start.tzinfo is None
+        or end.tzinfo is None
+        or limit < 1
+        or limit > AUDIT_MAX_PAGE_LIMIT
+        or after_seq < 0
+        or horizon_seq < 0
+        or after_seq > horizon_seq
+    ):
+        raise _bad_cursor()
+    return {
+        "snapshot_id": snapshot_id,
+        "start": start,
+        "end": end,
+        "limit": limit,
+        "after_seq": after_seq,
+        "horizon_seq": horizon_seq,
+    }
+
+
+@app.get(
+    "/snapshots/{snapshot_id}/read-events",
+    response_model=ReadAuditEventPage,
+    dependencies=[Depends(require_service_key)],
+)
+def list_snapshot_read_events(
+    snapshot_id: UUID,
+    start: datetime = Query(..., description="窗口起点（含），ISO 8601"),
+    end: datetime = Query(..., description="窗口终点（不含），ISO 8601"),
+    limit: int = Query(default=AUDIT_DEFAULT_PAGE_LIMIT, ge=1, le=AUDIT_MAX_PAGE_LIMIT),
+    cursor: str | None = Query(default=None, max_length=AUDIT_MAX_CURSOR_CHARS),
+    db: Session = Depends(get_db),
+):
+    """维护侧分页查询某快照在时间范围内的成功读取审计事件。
+
+    - 鉴权：服务密钥（缺失/错误 401）；未知快照明确拒绝（404）；
+      非法时间范围或游标 422；
+    - 时间窗口左闭右开 [start, end)，naive 时间按 UTC 处理；
+    - 分页按库内单调序号（提交顺序）推进，游标不透明且只能在同一查询内续用；
+    - 并发安全：首页以查询开始时该快照“已提交事件的最大序号”为上界，
+      此后各页沿用该上界——窗口内、查询起点前已提交的事件跨页既不重复也不遗漏；
+      查询期间新提交的事件可能落在上界之后，留待下次查询，不会造成重排；
+    - 响应只含 event_id / snapshot_id / occurred_at / credential_kind /
+      credential_chain_id，绝不返回原文、脱敏正文或任何凭证明文。
+    """
+    if db.get(Snapshot, snapshot_id) is None:
+        # 未知快照明确拒绝，避免对不存在资源返回空页
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="snapshot not found"
+        )
+    window_start, window_end = _normalize_time_range(start, end)
+
+    if cursor is not None:
+        position = _decode_cursor(cursor)
+        # 游标只允许在同一快照、同一时间窗口与同一页大小的查询间流转
+        if (
+            position["snapshot_id"] != snapshot_id
+            or position["start"] != window_start
+            or position["end"] != window_end
+            or position["limit"] != limit
+        ):
+            raise _bad_cursor()
+        after_seq = position["after_seq"]
+        horizon_seq = position["horizon_seq"]
+    else:
+        after_seq = 0
+        # 首页上界：语句开始时可见的、该快照已提交事件的最大 seq。
+        # seq 为 IDENTITY 单调递增且公开读取按快照行锁串行提交，
+        # 故所有 <= 上界的事件在本次查询中必然稳定可见（无重复/遗漏）。
+        horizon_seq = db.execute(
+            select(func.coalesce(func.max(ReadAuditEvent.seq), 0)).where(
+                ReadAuditEvent.snapshot_id == snapshot_id
+            )
+        ).scalar_one()
+
+    rows = (
+        db.execute(
+            select(ReadAuditEvent)
+            .where(
+                ReadAuditEvent.snapshot_id == snapshot_id,
+                ReadAuditEvent.seq > after_seq,
+                ReadAuditEvent.seq <= horizon_seq,
+                ReadAuditEvent.occurred_at >= window_start,
+                ReadAuditEvent.occurred_at < window_end,
+            )
+            .order_by(ReadAuditEvent.seq)
+            .limit(limit + 1)
+        )
+        .scalars()
+        .all()
+    )
+    has_more = len(rows) > limit
+    page_rows = rows[:limit]
+    next_cursor = None
+    if page_rows and has_more:
+        last_seq = page_rows[-1].seq
+        next_cursor = _encode_cursor(
+            snapshot_id=snapshot_id,
+            start=window_start,
+            end=window_end,
+            limit=limit,
+            after_seq=last_seq,
+            horizon_seq=horizon_seq,
+        )
+    return ReadAuditEventPage(
+        snapshot_id=snapshot_id,
+        start=window_start,
+        end=window_end,
+        events=[
+            ReadAuditEventInfo(
+                event_id=row.id,
+                snapshot_id=row.snapshot_id,
+                occurred_at=row.occurred_at,
+                credential_kind=row.credential_kind,
+                credential_chain_id=row.credential_chain_id,
+            )
+            for row in page_rows
+        ],
+        next_cursor=next_cursor,
+    )
