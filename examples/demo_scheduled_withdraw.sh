@@ -4,6 +4,7 @@
 #   查询计划 -> 重复提交相同内容回放原计划（replayed=true）-> 改时间须先取消（409）->
 #   取消后重新安排一个 3 秒后生效的计划 -> 到点自动撤回（后台结算）->
 #   公开读取沿用模糊 403，不扣令牌次数、不写成功审计 -> 手动撤回只回放首次结果，不能改原因 ->
+#   维护侧记录快照列表在响应前结算已到点计划（撤回状态/预定时刻/计划原因立即可见）->
 #   再演示“手动撤回先发生”：计划终止为 superseded，撤回时间与原因以手动为准
 # 依赖：curl、jq
 set -euo pipefail
@@ -110,7 +111,30 @@ curl -sS -X POST "${BASE_URL}/snapshots/${SID}/withdraw" "${AUTH[@]}" \
 curl -sS "${BASE_URL}/records/${RECORD_ID}" "${AUTH[@]}" \
   | jq '.snapshots[0] | {status, withdrawn_at, withdraw_reason}'
 
-step "12. 另一快照演示“手动撤回先发生”：计划终止为 superseded，以手动时间和原因为准"
+step "12. 维护侧查询响应前结算：新建第二个记录，安排 1 秒后到点的计划，立即轮询
+      记录快照列表（在后台线程处理到之前即由查询自身结算）：到点快照显示
+      withdrawn + 预定撤回时刻 + 计划原因；计划查询同步 completed；未到点项仍 published"
+PUB4=$(curl -sS -X POST "${BASE_URL}/records" "${AUTH[@]}" -d '{
+  "text": "又一条记录，查询时到点示例。", "intervals": [{"start": 0, "end": 3}]}')
+RID3=$(echo "${PUB4}" | jq -r .record_id)
+PUB5=$(curl -sS -X POST "${BASE_URL}/records/${RID3}/publish" "${AUTH[@]}" -d '{"version": 1}')
+SID3=$(echo "${PUB5}" | jq -r .snapshot_id)
+DUE_AT3=$(date -u -d '+1 seconds' +%Y-%m-%dT%H:%M:%SZ)
+PLAN4=$(curl -sS -X POST "${BASE_URL}/snapshot-withdrawal-plans" "${AUTH[@]}" -d "{
+  \"snapshot_id\": \"${SID3}\",
+  \"scheduled_at\": \"${DUE_AT3}\",
+  \"reason\": \"维护查询响应前结算原因\"
+}")
+PLAN4_ID=$(echo "${PLAN4}" | jq -r .plan_id)
+sleep 1
+# 记录快照列表在响应前完成结算（即使后台轮询尚未跑本轮）
+curl -sS "${BASE_URL}/records/${RID3}" "${AUTH[@]}" \
+  | jq '.snapshots[0] | {status, withdrawn_at, withdraw_reason}'
+# 计划查询显示已完成：ended_at/withdrawn_at 均为预定时刻
+curl -sS "${BASE_URL}/snapshot-withdrawal-plans/${PLAN4_ID}" "${AUTH[@]}" \
+  | jq '{status, scheduled_at, ended_at, withdrawn_at}'
+
+step "13. 另一快照演示“手动撤回先发生”：计划终止为 superseded，以手动时间和原因为准"
 PUB2=$(curl -sS -X POST "${BASE_URL}/records" "${AUTH[@]}" -d '{
   "text": "另一条记录，示例内容。", "intervals": [{"start": 0, "end": 3}]}')
 RID2=$(echo "${PUB2}" | jq -r .record_id)
