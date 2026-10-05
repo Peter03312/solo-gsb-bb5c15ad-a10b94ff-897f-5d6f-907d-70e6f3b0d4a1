@@ -4,6 +4,8 @@
 
 **公开读取的时刻界限**：单快照令牌与多快照共享凭证走同一读取接口，阅览时段、凭证有效期、记录冻结与快照撤回（含定时撤回计划到点）一律以**取齐相关行锁（快照行 → 记录行 → 冻结行 → 凭证行）之后的服务端时刻**判定——请求在记录/冻结行锁或凭证行锁上等待并跨过阅览截止或凭证到期时，获锁后按新时刻统一返回原有模糊 `403 snapshot unavailable`，**不扣次数、不写成功审计**；等待期间到点的撤回计划按**预定时刻与计划原因**完成撤回。有效读取的响应、原子扣次与审计写入约定不变（详见“公开读取的行锁与时刻边界”）。
 
+**维护侧查询的到点可见性**：定时撤回计划已到点而后台轮询尚未处理时，维护侧查询**记录快照列表**（`GET /records/{record_id}`）或**共享凭证清单**（`GET /read-bundles`、`GET /read-bundles/{bundle_id}`）也不会再看到“公开”——两类查询在响应前按**快照 id 升序的稳定顺序**对所涉及快照加行锁并结算其已到点的有效计划：记录快照条目立即显示撤回状态、**预定撤回时刻与计划原因**，共享凭证清单项同步显示撤回状态，计划查询（`GET /snapshot-withdrawal-plans/{id}`）显示 `completed`。未到点及已取消计划不影响状态；与后台结算、手动撤回、计划取消并发时只保留先发生的有效终态，不重复结算、不改写首次原因；共享凭证中其他快照仍按原资格可读，到点快照的公开读取沿用模糊 403（不扣额度、不写成功审计）。
+
 支持两种发布方式：
 
 - **直接发布**（既有能力）：维护人员凭服务密钥直接发布指定版本；令牌到期与阅览截止的时刻判定以**取齐版本行、敏感短语清单行与快照行锁、确认快照仍可发布之后的服务端时刻**为准（相对到期时长从签发时刻起算，等待不占用令牌寿命；显式到期或阅览截止在等待中到达则沿用既有 `422` 整次拒绝，不留新快照或令牌；详见“直接发布的签发时刻”）；
@@ -183,7 +185,7 @@ WHERE tgrelid = 'read_audit_events'::regclass AND tgname LIKE 'trg_read_audit_ev
 | `POST` | `/snapshot-withdrawal-plans` | 服务密钥 | **安排快照未来永久撤回**：提交快照标识、带时区且晚于当前的 `scheduled_at` 与非空 `reason`；同内容重复提交回放原计划（200），时间/原因不同且已有有效计划时 `409` |
 | `GET` | `/snapshot-withdrawal-plans/{plan_id}` | 服务密钥 | 查询定时撤回计划（编号、状态 `pending/completed/cancelled/superseded`、预定时刻、原因、创建/终结时刻） |
 | `POST` | `/snapshot-withdrawal-plans/{plan_id}/cancel` | 服务密钥 | **生效前取消计划**；已生效/已取消/已终止计划的取消一律 `409` |
-| `GET` | `/records/{record_id}` | 服务密钥 | 查看当前版本、受控标记与快照列表（含撤回时间、原因、状态与外部阅览时段） |
+| `GET` | `/records/{record_id}` | 服务密钥 | 查看当前版本、受控标记与快照列表（含撤回时间、原因、状态与外部阅览时段）；**响应前按快照 id 稳定顺序结算已到点计划，到点快照立即显示撤回（预定时刻+计划原因）** |
 | `POST` | `/records/{record_id}/freeze` | 服务密钥 | **临时冻结记录**（首次需非空白 `reason`）：覆盖现有及期间新发布的全部快照；重复冻结幂等、不覆盖原因/开始时间 |
 | `GET` | `/records/{record_id}/freeze` | 服务密钥 | 查询当前冻结状态（当前冻结期开始时间、原因；未冻结时各字段为 null） |
 | `POST` | `/records/{record_id}/unfreeze` | 服务密钥 | **解除冻结**（幂等）：只恢复原本仍有效的读取资格，不复活失效凭证/额度/已撤回快照 |
@@ -195,8 +197,8 @@ WHERE tgrelid = 'read_audit_events'::regclass AND tgname LIKE 'trg_read_audit_ev
 | `POST` | `/bundle-requests/{request_id}/reject` | reviewer（非申请人） | 驳回共享凭证申请（可带 `reason`），终态，不签发凭证 |
 | `GET` | `/bundle-requests/{request_id}` | 任一已认证操作者 | 查询单个共享凭证申请（冻结清单与额度，不含原文） |
 | `GET` | `/bundle-requests` | 任一已认证操作者 | 列出全部共享凭证申请（不含原文） |
-| `GET` | `/read-bundles` | 服务密钥 | 列出全部已签发共享凭证：清单、额度、状态（不含原文） |
-| `GET` | `/read-bundles/{bundle_id}` | 服务密钥 | 查询单个共享凭证的清单、`max_reads`/`reads_used`/`remaining_reads` 与状态 |
+| `GET` | `/read-bundles` | 服务密钥 | 列出全部已签发共享凭证：清单、额度、状态（不含原文）；**响应前结算清单项的已到点计划，到点项立即同步撤回状态** |
+| `GET` | `/read-bundles/{bundle_id}` | 服务密钥 | 查询单个共享凭证的清单、`max_reads`/`reads_used`/`remaining_reads` 与状态；**响应前同样结算清单项的已到点计划** |
 | `POST` | `/read-bundles/{bundle_id}/revoke` | 服务密钥 | 撤销共享凭证（撤销后全部读取 403） |
 | `POST` | `/credentials/rotate` | 服务密钥 | **泄露换发**：提交原凭证 + 请求标识，单快照令牌/多快照共享凭证统一换发为新随机凭证 |
 | `GET` | `/snapshots/{snapshot_id}/read-events` | 服务密钥 | **成功读取审计**：按快照 + 时间范围分页查询不可变读取事件（游标翻页；不含原文/凭证） |
@@ -238,7 +240,7 @@ WHERE tgrelid = 'read_audit_events'::regclass AND tgname LIKE 'trg_read_audit_ev
   - **提交受控申请** → `409`；
   - 撤回前已存在的**待审申请**，批准时 → `409`（不签发令牌），但**仍可驳回**；已批准申请记录继续留存。
 - **状态码**：未知快照 `404`；缺失或错误服务密钥沿用 `401`；首次撤回缺少非空白 `reason` → `422`。
-- **维护侧可见**：`GET /records/{record_id}` 的每个快照条目含 `status`（`published` / `withdrawn`）、`withdrawn_at`、`withdraw_reason`。
+- **维护侧可见**：`GET /records/{record_id}` 的每个快照条目含 `status`（`published` / `withdrawn`）、`withdrawn_at`、`withdraw_reason`；该查询在响应前先结算本记录快照已到点的定时撤回计划，到点（后台尚未轮询）时立即显示撤回状态、预定撤回时刻与计划原因。
 
 ### 快照定时永久撤回
 
@@ -278,6 +280,24 @@ WHERE tgrelid = 'read_audit_events'::regclass AND tgname LIKE 'trg_read_audit_ev
   受控申请提交/批准、共享凭证申请/批准、计划查询/取消）在锁内先做一次**惰性到期
   结算**。因此即使重启期间无人访问、或多个实例并发运行，到期计划也必被结算；
   快照行锁与“只命中 pending 行”的条件更新保证**恰好生效一次**。
+- **维护侧两类列表查询的到点可见性**：计划已到点而后台轮询尚未处理（例如轮询
+  间隔内、服务刚重启）时，维护侧查询也不会再看到“公开”状态——
+  - `GET /records/{record_id}`（记录快照列表）与 `GET /read-bundles`、
+    `GET /read-bundles/{bundle_id}`（共享凭证清单/凭证状态）在**响应前**先筛出
+    本次涉及快照中仍挂有有效（pending）计划者（无有效计划的快照不加锁），按
+    **快照 id 升序的稳定顺序**对它们逐一加行锁，取齐后读取一次服务端时刻并结算
+    已到点（`scheduled_at <= now`）的有效计划，随响应一同提交，再组装响应；
+    多快照按同一固定顺序处理，与共享凭证申请/批准/换发等多快照事务同序，不形成
+    死锁环；
+  - 记录快照条目立即显示 `status="withdrawn"`、`withdrawn_at`=**预定撤回时刻**、
+    `withdraw_reason`=**计划原因**；共享凭证清单项同步 `status="withdrawn"` 与
+    `withdrawn_at`，凭证清单与额度不变；对应 `GET /snapshot-withdrawal-plans/{id}`
+    立即显示 `completed`（`ended_at`/`withdrawn_at` 均等于预定时刻）；
+  - **未到点**计划与**已取消**计划不改变任何状态（快照仍 `published`）；共享凭证
+    中未撤回的其他快照仍按原资格可读；到点快照的公开读取沿用模糊
+    `403 snapshot unavailable`，**不扣额度、不写成功审计**；
+  - 与后台结算、手动撤回、计划取消并发时仍由快照行锁串行化，**只保留先发生的
+    有效终态**：查询重复访问只回放首次结果，不重复结算、不改写首次撤回时间与原因。
 - **到点后的公开读取**：完全沿用既有模糊 `403 snapshot unavailable`——不扣单快照
   令牌或共享凭证额度、不写成功读取审计、公开侧不透露撤回原因；共享清单内其他快照
   不受影响。
@@ -378,6 +398,32 @@ curl -sS http://localhost:8000/publish-requests/<PRID> -u alice:alice-pw
 curl -sS -X POST http://localhost:8000/publish-requests/<PRID>/reject \
   -u bob:bob-pw -H "Content-Type: application/json" -d '{"reason":"版本已按计划撤回"}'
 # => {"request_id":"<PRID>","status":"rejected", ...}
+
+# 6d. 计划已到点而后台轮询尚未处理：维护侧两类列表查询在响应前先结算，
+#     不再显示“公开”；多快照按快照 id 升序稳定处理，并发时只保留先发生的终态。
+# 记录快照列表：到点快照立即为 withdrawn，withdrawn_at=预定时刻、withdraw_reason=计划原因
+curl -sS http://localhost:8000/records/<RID> -H "X-Service-Key: dev-service-key-change-me"
+# => {"record_id":"<RID>","current_version":1,"controlled":false,
+#     "snapshots":[{"snapshot_id":"<SID>","version":1,"status":"withdrawn",
+#                   "withdrawn_at":"<预定时刻>","withdraw_reason":"保留期届满，到期永久撤回",
+#                   "window_open_at":null,"window_close_at":null, ...}]}
+# 计划查询显示已完成（同一结算事务落库，不重复结算）
+curl -sS http://localhost:8000/snapshot-withdrawal-plans/<PID> \
+  -H "X-Service-Key: dev-service-key-change-me"
+# => {"plan_id":"<PID>","status":"completed","ended_at":"<预定时刻>",
+#     "withdrawn_at":"<预定时刻>", ...}
+# 共享凭证清单：到点项同步 withdrawn，其他项仍 published 且继续可读
+curl -sS http://localhost:8000/read-bundles -H "X-Service-Key: dev-service-key-change-me"
+# => {"bundles":[{"bundle_id":"<BID>","reads_used":0,
+#     "items":[{"snapshot_id":"<SID>","status":"withdrawn","withdrawn_at":"<预定时刻>","position":0,...},
+#              {"snapshot_id":"<SID2>","status":"published","withdrawn_at":null,"position":1,...}], ...}]}
+# 到点项的公开读取仍沿用模糊 403：不扣共享额度、不写成功审计、不透露原因
+curl -sS "http://localhost:8000/public/snapshots/<SID>?token=<CREDENTIAL>"
+# => 403 {"detail":"snapshot unavailable"}
+# 清单内其他快照按原资格继续可读
+curl -sS "http://localhost:8000/public/snapshots/<SID2>?token=<CREDENTIAL>"
+# => {"record_id":"<RID2>","version":1,"status":"published","redacted_text":"…"}
+# 未到点或已取消计划不影响状态：同一查询中其他快照仍为 published。
 ```
 
 完整端到端演示（含 401/409/422、快照不可变、`max_reads` 次数上限与独立计数、维护侧计数查询、撤销与到期）：
@@ -599,6 +645,7 @@ python3 -m unittest \
 - **为什么需要取锁后再判定**：请求取得快照行锁后，仍可能在记录/冻结行锁上等待（与并发冻结、解除排队），或在凭证行锁上等待（与并发成功读取、撤销、换发排队）。等待可能跨过阅览时段截止时刻或凭证到期时刻；若用等待前的旧时刻判定，已失效的读取会错误地返回脱敏正文、扣减额度并写入成功审计。获锁后改按新时刻判定可消除该竞态。
 - **跨界限结果**：等待期间时段截止、凭证到期、冻结被并发提交或定时撤回计划到点，获锁后一律返回**原有模糊 403** `{"detail":"snapshot unavailable"}`（不区分原因、不透露冻结/窗口/到期信息），**不扣次数**（令牌与共享额度都不消耗）、**不写成功读取审计**。
 - **定时撤回计划在等待期间到点**：读取在快照行锁内惰性结算时按**预定时刻 `scheduled_at` 与计划原因**完成撤回（不是按结算发生时刻），结算随该次请求提交落库，随后按“已撤回快照”路径返回 403；后台轮询线程与各请求路径的双保险、重启/多实例不漏不重的既有约定不变。
+- **维护侧只读列表查询同样在响应前结算**：计划已到点而后台轮询尚未处理时，`GET /records/{record_id}`（记录快照列表）与 `GET /read-bundles`、`GET /read-bundles/{bundle_id}`（共享凭证清单）先筛出涉及快照中仍挂有有效计划者，再按**快照 id 升序**对其加行锁（无有效计划的快照不加锁），取齐后取一次服务端时刻并结算到点计划（多快照稳定顺序、与多快照事务同锁序），随响应提交后再组装：到点快照/清单项立即显示撤回（预定时刻+计划原因），计划查询显示 `completed`；未到点及已取消计划不影响状态，并发时只保留先发生的有效终态（不重复结算、不改写首次原因），到点快照的公开读取仍走本节的模糊 403 约定。
 - **有效读取不变**：获锁后凭证仍有效（未撤销、未换发、未到期、额度未用尽）、快照未撤回、记录未冻结且处于阅览时段内时，响应体与原先完全一致；额度扣减与成功读取审计事件仍在**同一事务**原子提交，并发成功读取由凭证行锁串行化，绝不超支额度。
 - **鉴权与维护接口约定不变**：公开读取仍无需任何密钥；服务密钥、HTTP Basic 等维护侧接口的请求/响应约定不受影响。
 
@@ -875,7 +922,7 @@ python3 -m unittest \
    - 每次**成功**读取扣一次**共享**额度（`reads_used` 跨清单累计，只增不减）；并发读取由同一条条件 `UPDATE` 原子判定并递增，成功总次数绝不超过 `max_reads`；
    - 清单内**某项快照后来撤回**：只拒绝该项（快照行锁阶段即 403），**不扣额度**，其他项仍可凭同一凭证读取；
    - **到期、撤销或额度耗尽**时，清单内全部快照一律 `403`；这些失败请求都不消耗额度。
-5. **维护侧（服务密钥）**：`GET /read-bundles` 与 `GET /read-bundles/{bundle_id}` 返回凭证清单（每项含 `snapshot_id`、`record_id`、`version`、`position` 与当前 `status`/`withdrawn_at`）、`max_reads` / `reads_used` / `remaining_reads` / `active` 与到期、撤销时间，**不含任何原文**；`POST /read-bundles/{bundle_id}/revoke` 撤销凭证（幂等），撤销提交后新开始的读取全部 `403`。
+5. **维护侧（服务密钥）**：`GET /read-bundles` 与 `GET /read-bundles/{bundle_id}` 返回凭证清单（每项含 `snapshot_id`、`record_id`、`version`、`position` 与当前 `status`/`withdrawn_at`）、`max_reads` / `reads_used` / `remaining_reads` / `active` 与到期、撤销时间，**不含任何原文**；两类查询在响应前按快照 id 稳定顺序结算清单项已到点的定时撤回计划，到点项立即同步撤回状态（凭证清单与额度不变、其他项仍可读），未到点/已取消计划不影响条目；`POST /read-bundles/{bundle_id}/revoke` 撤销凭证（幂等），撤销提交后新开始的读取全部 `403`。
 6. **与既有能力兼容**：原有单快照令牌的读取、计数、查询（`/tokens/{token}`）、撤销与受控/直接发布接口的行为与响应**保持不变**；共享凭证是独立命名空间，不会出现在 `/tokens` 中，单快照令牌也不受共享额度影响。
 
 ### 调用示例
@@ -1390,7 +1437,7 @@ examples/
   demo.sh             # 直接发布端到端调用示例
   demo_controlled.sh  # 受控发布（申请-复核）端到端调用示例
   demo_withdraw.sh    # 快照永久撤回端到端调用示例
-  demo_scheduled_withdraw.sh # 快照定时永久撤回（安排/查询/取消/到点自动撤回/与手动撤回先后规则）端到端调用示例
+  demo_scheduled_withdraw.sh # 快照定时永久撤回（安排/查询/取消/到点自动撤回/维护侧记录列表与共享凭证清单查询响应前结算/与手动撤回先后规则）端到端调用示例
   demo_freeze.sh      # 记录临时冻结（冻结/查询/解除 + 并发边界语义）端到端调用示例
   demo_windows.sh     # 快照外部阅览时段（窗口边界/沿用与冲突/受控拒批/共享凭证逐快照判定）端到端调用示例
   demo_bundles.sh     # 多快照共享凭证（申请-复核 + 共用额度）端到端调用示例

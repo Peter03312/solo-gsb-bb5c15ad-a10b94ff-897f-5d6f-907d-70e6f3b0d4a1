@@ -4,8 +4,10 @@
 #   查询计划 -> 重复提交相同内容回放原计划（replayed=true）-> 改时间须先取消（409）->
 #   取消后重新安排一个 3 秒后生效的计划 -> 到点自动撤回（后台结算）->
 #   公开读取沿用模糊 403，不扣令牌次数、不写成功审计 -> 手动撤回只回放首次结果，不能改原因 ->
+#   维护侧记录快照列表查询在响应前结算到点计划（无需等后台轮询，立即显示撤回/预定时刻/计划原因）->
+#   共享凭证清单/凭证状态查询同样在响应前结算：到点项撤回且 403 不扣共享额度，其他项继续可读 ->
 #   再演示“手动撤回先发生”：计划终止为 superseded，撤回时间与原因以手动为准
-# 依赖：curl、jq
+# 依赖：curl、jq、alice/bob 的受控发布凭据（见 docker-compose.yml）
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:8000}"
@@ -94,6 +96,76 @@ done
 echo "计划最终状态: ${STATUS}"
 curl -sS "${BASE_URL}/snapshot-withdrawal-plans/${PLAN2_ID}" "${AUTH[@]}" \
   | jq '{plan_id, status, scheduled_at, ended_at, withdrawn_at, reason}'
+
+step "9b. 到点可见性：维护侧记录快照列表响应前先结算——无需等待后台轮询即显示撤回"
+# 再造一个 2 秒后到点的计划；到点后第一次维护侧列表查询自身就会在快照行锁内完成结算
+# （后台轮询是否先处理都一样：快照行锁保证恰好生效一次，不重复结算、不改写首次原因）。
+RID9=$(curl -sS -X POST "${BASE_URL}/records" "${AUTH[@]}" -d '{
+  "text": "列表查询到点可见性示例。", "intervals": [{"start": 0, "end": 3}]}' | jq -r .record_id)
+SID9=$(curl -sS -X POST "${BASE_URL}/records/${RID9}/publish" "${AUTH[@]}" \
+  -d '{"version":1}' | jq -r .snapshot_id)
+DUE9=$(date -u -d '+2 seconds' +%Y-%m-%dT%H:%M:%SZ)
+PLAN9=$(curl -sS -X POST "${BASE_URL}/snapshot-withdrawal-plans" "${AUTH[@]}" -d "{
+  \"snapshot_id\": \"${SID9}\",
+  \"scheduled_at\": \"${DUE9}\",
+  \"reason\": \"维护侧列表查询到点即撤回\"
+}")
+PLAN9_ID=$(echo "${PLAN9}" | jq -r .plan_id)
+for _ in $(seq 1 30); do
+  ROW=$(curl -sS "${BASE_URL}/records/${RID9}" "${AUTH[@]}" | jq -c '.snapshots[0]')
+  [ "$(echo "${ROW}" | jq -r .status)" = "withdrawn" ] && break
+  sleep 0.25
+done
+echo "记录快照列表条目（status/withdrawn_at=预定时刻/withdraw_reason=计划原因）:"
+echo "${ROW}" | jq '{status, withdrawn_at, withdraw_reason}'
+echo "${ROW}" | jq -e '.status == "withdrawn" and .withdraw_reason == "维护侧列表查询到点即撤回"' >/dev/null
+curl -sS "${BASE_URL}/snapshot-withdrawal-plans/${PLAN9_ID}" "${AUTH[@]}" \
+  | jq '{plan_id, status, ended_at, withdrawn_at}'
+
+step "9c. 共享凭证清单同样在响应前结算：到点项撤回、其他项仍可读"
+# 两个快照组成共享凭证：A 2 秒后到点，B 无计划；凭证状态查询/全量清单查询到点即反映
+RIDA=$(curl -sS -X POST "${BASE_URL}/records" "${AUTH[@]}" -d '{
+  "text": "清单项A示例。", "intervals": [{"start": 0, "end": 3}]}' | jq -r .record_id)
+RIDB=$(curl -sS -X POST "${BASE_URL}/records" "${AUTH[@]}" -d '{
+  "text": "清单项B示例。", "intervals": [{"start": 0, "end": 3}]}' | jq -r .record_id)
+SIDA=$(curl -sS -X POST "${BASE_URL}/records/${RIDA}/publish" "${AUTH[@]}" \
+  -d '{"version":1}' | jq -r .snapshot_id)
+SIDB=$(curl -sS -X POST "${BASE_URL}/records/${RIDB}/publish" "${AUTH[@]}" \
+  -d '{"version":1}' | jq -r .snapshot_id)
+BREQ=$(curl -sS -X POST "${BASE_URL}/bundle-requests" -u alice:alice-pw \
+  -H 'Content-Type: application/json' \
+  -d "{\"snapshot_ids\":[\"${SIDA}\",\"${SIDB}\"],\"max_reads\":5}")
+BID=$(echo "${BREQ}" | jq -r .request_id)
+BAPP=$(curl -sS -X POST "${BASE_URL}/bundle-requests/${BID}/approve" -u bob:bob-pw)
+BUNDLE_ID=$(echo "${BAPP}" | jq -r .bundle_id)
+CRED=$(echo "${BAPP}" | jq -r .credential)
+DUEA=$(date -u -d '+2 seconds' +%Y-%m-%dT%H:%M:%SZ)
+PLANA=$(curl -sS -X POST "${BASE_URL}/snapshot-withdrawal-plans" "${AUTH[@]}" -d "{
+  \"snapshot_id\": \"${SIDA}\",
+  \"scheduled_at\": \"${DUEA}\",
+  \"reason\": \"共享清单项A到点\"
+}")
+PLANA_ID=$(echo "${PLANA}" | jq -r .plan_id)
+for _ in $(seq 1 30); do
+  STATUS_A=$(curl -sS "${BASE_URL}/read-bundles/${BUNDLE_ID}" "${AUTH[@]}" \
+    | jq -r --arg s "${SIDA}" '.items[] | select(.snapshot_id == $s) | .status')
+  [ "${STATUS_A}" = "withdrawn" ] && break
+  sleep 0.25
+done
+echo "单个凭证状态查询的清单项（A=withdrawn，B=published，顺序仍按 position）:"
+curl -sS "${BASE_URL}/read-bundles/${BUNDLE_ID}" "${AUTH[@]}" \
+  | jq '{bundle_id, reads_used, items: [.items[] | {position, status, withdrawn_at}]}'
+echo "全量共享凭证清单查询同样反映:"
+curl -sS "${BASE_URL}/read-bundles" "${AUTH[@]}" \
+  | jq --arg b "${BUNDLE_ID}" '.bundles[] | select(.bundle_id == $b)
+      | {bundle_id, items: [.items[] | {position, status}]}'
+echo "到点项 A 的公开读取模糊 403，不扣共享额度："
+printf '  读 A: HTTP %s\n' "$(code "${BASE_URL}/public/snapshots/${SIDA}?token=${CRED}")"
+curl -sS "${BASE_URL}/read-bundles/${BUNDLE_ID}" "${AUTH[@]}" | jq -e '.reads_used == 0' >/dev/null
+echo "  凭证 reads_used 仍为 0；清单项 B 继续可读："
+printf '  读 B: HTTP %s\n' "$(code "${BASE_URL}/public/snapshots/${SIDB}?token=${CRED}")"
+curl -sS "${BASE_URL}/snapshot-withdrawal-plans/${PLANA_ID}" "${AUTH[@]}" \
+  | jq -e '.status == "completed"' >/dev/null && echo "  计划 A 状态: completed"
 
 step "10. 到点后的公开读取沿用模糊 403：不扣令牌额度、不写成功审计、不透露原因"
 printf '读取 HTTP %s: ' "$(code "${BASE_URL}/public/snapshots/${SID}?token=${TOK}")"

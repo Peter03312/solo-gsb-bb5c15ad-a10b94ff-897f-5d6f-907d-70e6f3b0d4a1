@@ -299,11 +299,69 @@ def settle_due_withdrawals_once(db: Session, now: datetime | None = None) -> int
     return settled
 
 
+def settle_due_plans_for_snapshots(
+    db: Session, snapshot_ids: list[UUID] | set[UUID]
+) -> None:
+    """维护侧只读查询返回前的批量到期结算：把所涉及快照的已到点有效计划先落库。
+
+    用于“记录快照列表”（GET /records/{record_id}）与“共享凭证清单”
+    （GET /read-bundles 与 GET /read-bundles/{bundle_id}）两类维护侧查询：
+    计划到点而后台轮询尚未处理时，查询本身不能再把快照显示为公开——响应组装
+    前先在此完成结算，使快照条目立刻显示撤回状态、预定撤回时刻与计划原因，
+    对应计划查询也已为 completed。
+
+    先（非锁定）筛出本批中仍挂有 pending 计划的快照——每快照至多一个有效计划，
+    无 pending 计划的快照不加任何锁；再对命中的快照按 **snapshot id 升序**的
+    稳定顺序取快照行锁（与共享凭证申请/批准/换发等多快照事务同序，避免交叉
+    加锁形成死锁环），取齐行锁后才取服务端时刻 now（“先取锁、后取时”），使
+    等锁期间到点的计划同样被捕获。新计划创建即要求 scheduled_at 晚于提交时刻，
+    不会在本请求内新出现到点计划；并发中的手动撤回/取消/后台结算由快照行锁
+    串行化，结算复用 _settle_snapshot_withdrawal_plans（仅命中 pending 行）：
+    只保留先发生的有效终态，不重复结算、不改写首次撤回时间与原因；未到点及
+    已取消计划不改变任何状态。
+
+    本函数不提交事务，由调用方在组装响应前提交（无终结发生时提交为空操作）。
+    """
+    unique_ids = set(snapshot_ids)
+    if not unique_ids:
+        return
+    pending_snapshot_ids = (
+        db.execute(
+            select(SnapshotWithdrawalPlan.snapshot_id)
+            .where(
+                SnapshotWithdrawalPlan.snapshot_id.in_(unique_ids),
+                SnapshotWithdrawalPlan.status == WITHDRAWAL_PLAN_PENDING,
+            )
+            .distinct()
+        )
+        .scalars()
+        .all()
+    )
+    if not pending_snapshot_ids:
+        return
+    # 仅锁仍有有效计划的快照；快照 id 升序的稳定加锁顺序：与多快照批准/换发同序
+    snapshots = (
+        db.execute(
+            select(Snapshot)
+            .where(Snapshot.id.in_(pending_snapshot_ids))
+            .order_by(Snapshot.id)
+            .with_for_update()
+        )
+        .scalars()
+        .all()
+    )
+    # 等锁期间可能跨过计划到点时刻：now 在取齐本批行锁之后读取
+    now = datetime.now(timezone.utc)
+    for snapshot in snapshots:
+        _settle_snapshot_withdrawal_plans(db, snapshot, now)
+
+
 class _WithdrawalScheduler:
     """定时撤回后台结算线程：每个 API 实例各跑一个，只做到期兜底。
 
     正确性不依赖本线程：所有会触及快照行锁的请求路径（公开读取、手动撤回、
-    发布/复核等）都在锁内先惰性结算到期计划。本线程保证“无人访问的快照”
+    发布/复核、计划查询/取消，以及记录快照列表与共享凭证清单两类只读查询在
+    响应前的批量结算）都在锁内先惰性结算到期计划。本线程保证“无人访问的快照”
     到点后也能及时落库；线程崩溃、服务重启或多实例并发都不影响语义——
     计划持久化在库中，行锁与条件 UPDATE 保证恰好生效一次，绝不漏执行。
     """
@@ -359,8 +417,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Redacted Records API",
-    version="1.13.0",
-    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 快照定时撤回 + 多快照共享凭证 + 泄露换发 + 成功读取审计 + 记录临时冻结 + 敏感短语清单核验 + 快照外部阅览时段 + 历史版本原文销毁 + 直接发布签发时刻修正 + 受控提交/批准统一锁序防死锁 + 版本化数据库升级）",
+    version="1.14.0",
+    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 快照定时撤回 + 多快照共享凭证 + 泄露换发 + 成功读取审计 + 记录临时冻结 + 敏感短语清单核验 + 快照外部阅览时段 + 历史版本原文销毁 + 直接发布签发时刻修正 + 受控提交/批准统一锁序防死锁 + 维护侧列表查询到点可见性 + 版本化数据库升级）",
     lifespan=lifespan,
 )
 
@@ -1557,7 +1615,12 @@ def list_bundle_requests(
     dependencies=[Depends(require_service_key)],
 )
 def list_read_bundles(db: Session = Depends(get_db)):
-    """维护侧查询全部共享凭证的清单、额度与状态（绝不返回快照原文）。"""
+    """维护侧查询全部共享凭证的清单、额度与状态（绝不返回快照原文）。
+
+    响应前先按快照 id 稳定顺序结算全部清单项所涉及快照的已到点有效计划：
+    计划到点而后台轮询尚未处理时，清单项立即同步为撤回状态（withdrawn_at 取
+    预定时刻）；凭证清单本身不变，清单内其他未撤回快照仍按原资格可读。
+    """
     bundles = (
         db.execute(
             select(ReadBundle)
@@ -1567,6 +1630,12 @@ def list_read_bundles(db: Session = Depends(get_db)):
         .scalars()
         .all()
     )
+    # 先在稳定锁序内结算全部清单项快照的到点计划并提交，再加载快照组装响应，
+    # 保证条目状态与结算落库一致；未到点/已取消计划不影响任何条目。
+    settle_due_plans_for_snapshots(
+        db, {item.snapshot_id for bundle in bundles for item in bundle.items}
+    )
+    db.commit()
     snapshots = _load_bundle_snapshots(db, bundles)
     return ReadBundleListResponse(
         bundles=[_bundle_status_response(bundle, snapshots) for bundle in bundles]
@@ -1579,12 +1648,19 @@ def list_read_bundles(db: Session = Depends(get_db)):
     dependencies=[Depends(require_service_key)],
 )
 def get_read_bundle(bundle_id: UUID, db: Session = Depends(get_db)):
-    """维护侧查询单个共享凭证的清单、额度与状态（绝不返回快照原文）。"""
+    """维护侧查询单个共享凭证的清单、额度与状态（绝不返回快照原文）。
+
+    响应前先按快照 id 稳定顺序结算清单快照的已到点有效计划：计划到点而后台
+    轮询尚未处理时，对应清单项立即同步为撤回状态；其他清单项仍按原资格可读。
+    """
     bundle = db.get(ReadBundle, bundle_id)
     if bundle is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="read bundle not found"
         )
+    # 触发 items 加载后再结算（selectinload 仅用于列表接口），稳定锁序，无锁序环
+    settle_due_plans_for_snapshots(db, [item.snapshot_id for item in bundle.items])
+    db.commit()
     snapshots = _load_bundle_snapshots(db, [bundle])
     return _bundle_status_response(bundle, snapshots)
 
@@ -2234,7 +2310,13 @@ def cancel_snapshot_withdrawal_plan(plan_id: UUID, db: Session = Depends(get_db)
     dependencies=[Depends(require_service_key)],
 )
 def get_record(record_id: UUID, db: Session = Depends(get_db)):
-    """维护侧查看记录当前版本、受控标记与已发布快照列表。"""
+    """维护侧查看记录当前版本、受控标记与已发布快照列表。
+
+    响应前先按快照 id 稳定顺序结算本记录全部快照的已到点有效计划：计划到点
+    而后台轮询尚未处理时，快照条目立即显示撤回状态、预定撤回时刻与计划原因。
+    未到点及已取消计划不影响状态；与后台结算/手动撤回/计划取消并发时只保留
+    先发生的有效终态，不重复结算或改写首次原因。
+    """
     record = db.get(Record, record_id)
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="record not found")
@@ -2245,6 +2327,10 @@ def get_record(record_id: UUID, db: Session = Depends(get_db)):
         .scalars()
         .all()
     )
+    # 响应前结算：对仍挂有有效计划的快照在稳定锁序内加锁并终结到点计划，
+    # 提交后 identity-map 中的快照对象即为结算后的最终状态（列表顺序仍为 version）。
+    settle_due_plans_for_snapshots(db, [snapshot.id for snapshot in snapshots])
+    db.commit()
     return RecordStatusResponse(
         record_id=record.id,
         current_version=record.current_version,
